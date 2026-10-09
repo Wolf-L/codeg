@@ -1,5 +1,6 @@
 "use client"
 
+import { nativeTurnId } from "@/lib/native-session"
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   isLiveTurnId,
@@ -152,6 +153,8 @@ interface MessageListViewProps {
    * is transient and comes back, so the view renders it as a disabled button
    * (see `forkBusy`) rather than making every reply's footer flicker.
    */
+  nativeEditDisabled?: boolean
+  onEditUserTurn?: (turn: MessageTurn) => void
   onForkFromTurn?: (turnId: string) => void
 }
 
@@ -919,6 +922,8 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   roundOpen = true,
   onRoundOpenChange,
   foldEpoch = 0,
+  nativeEditDisabled,
+  onEditUserTurn,
   onForkFromTurn,
   forkDisabled = false,
   isThreadTail = false,
@@ -933,12 +938,15 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   roundOpen?: boolean
   onRoundOpenChange?: (open: boolean) => void
   foldEpoch?: number
+  nativeEditDisabled?: boolean
+  onEditUserTurn?: (turn: MessageTurn) => void
   onForkFromTurn?: (turnId: string) => void
   forkDisabled?: boolean
   /** Whether nothing follows this group in the thread — the one position where
    *  a turn the backend cannot name still forks where the user pointed. */
   isThreadTail?: boolean
 }) {
+  const tNative = useTranslations("NativeSession")
   if (group.role === "system") {
     return <CollapsibleSystemMessage parts={group.parts} />
   }
@@ -958,6 +966,18 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
         ) : null}
         {group.role === "user" ? (
           <div className="group/user-msg flex w-fit ml-auto max-w-full items-start gap-1">
+            {onEditUserTurn &&
+              sourceTurns?.[0] &&
+              nativeTurnId(sourceTurns[0]) && (
+                <button
+                  type="button"
+                  className="rounded px-2 py-1 text-xs text-muted-foreground hover:bg-muted disabled:opacity-50"
+                  disabled={forkDisabled || nativeEditDisabled}
+                  onClick={() => onEditUserTurn(sourceTurns[0])}
+                >
+                  {tNative("edit")}
+                </button>
+              )}
             <UserMessageTaskButton parts={group.parts} />
             <UserMessageCopyButton parts={group.parts} />
             <MessageContent>
@@ -1077,6 +1097,8 @@ export function MessageListView({
   onQuoteSelection,
   onAskSelection,
   onSaveNoteSelection,
+  nativeEditDisabled,
+  onEditUserTurn,
   onForkFromTurn,
 }: MessageListViewProps) {
   const t = useTranslations("Folder.chat.messageList")
@@ -1406,6 +1428,10 @@ export function MessageListView({
                 roundOpen={fold.roundOpen}
                 onRoundOpenChange={handleRoundOpenChange}
                 foldEpoch={fold.epoch}
+                nativeEditDisabled={nativeEditDisabled}
+                onEditUserTurn={
+                  item.phase === "optimistic" ? undefined : onEditUserTurn
+                }
                 onForkFromTurn={onForkFromTurn}
                 forkDisabled={forkBusy}
                 isThreadTail={item.isThreadTail}
@@ -1436,6 +1462,8 @@ export function MessageListView({
       fold.roundOpen,
       fold.epoch,
       handleRoundOpenChange,
+      nativeEditDisabled,
+      onEditUserTurn,
       onForkFromTurn,
       forkBusy,
     ]

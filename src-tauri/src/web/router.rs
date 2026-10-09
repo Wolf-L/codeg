@@ -960,6 +960,8 @@ pub fn build_router(
             "/acp_goal_control",
             post(handlers::acp::acp_goal_control),
         )
+        .route("/acp_native_capabilities", post(handlers::acp::acp_native_capabilities))
+        .route("/acp_native_operation", post(handlers::acp::acp_native_operation))
         .route(
             "/acp_describe_agent_options",
             post(handlers::acp::acp_describe_agent_options),

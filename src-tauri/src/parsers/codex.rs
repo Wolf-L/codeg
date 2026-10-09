@@ -27,6 +27,10 @@ pub struct CodexParser {
     base_dir: PathBuf,
 }
 
+#[path = "codex_native_identity.rs"]
+mod native_identity;
+pub(crate) use native_identity::native_user_message_text;
+
 /// How far into a rollout to look for the `session_meta` carrying its history
 /// pointer. It is line 0 in every file on disk; the slack is for a future
 /// preamble, and the bound is what keeps this off the cost of a full parse for
@@ -257,11 +261,21 @@ impl CodexParser {
     /// because the parser latches `parent_id` from the FIRST header it sees and
     /// the child's is the one that declares the lineage.
     fn rollout_lines(&self, path: &Path) -> Result<Vec<String>, ParseError> {
+        self.rollout_lines_checked(path, false)
+    }
+
+    // Native guards must not silently accept the viewer's partial-history fallback.
+    fn rollout_lines_checked(&self, path: &Path, strict: bool) -> Result<Vec<String>, ParseError> {
         let read = |path: &Path| -> Result<Vec<String>, ParseError> {
-            let own = BufReader::new(fs::File::open(path)?)
-                .lines()
-                .map_while(Result::ok)
-                .collect();
+            let reader = BufReader::new(fs::File::open(path)?);
+            let own: Vec<String> = if strict {
+                reader.lines().collect::<Result<_, _>>()?
+            } else {
+                reader.lines().map_while(Result::ok).collect()
+            };
+            if strict {
+                native_identity::validate_rollout(&own)?;
+            }
             Ok(trim_subagent_replay_prefix(own))
         };
 
@@ -275,6 +289,9 @@ impl CodexParser {
             .collect();
         while let Some((header_idx, base_id, cut)) = inherited_history_pointer(&lines) {
             if !visited.insert(base_id.clone()) {
+                if strict {
+                    return Err(ParseError::InvalidData("Native user identity: cyclic history".into()));
+                }
                 tracing::warn!(
                     rollout_id = %base_id,
                     "[codex] rollout history points back into itself; rendering what was reached"
@@ -282,12 +299,20 @@ impl CodexParser {
                 break;
             }
             let Some(base_path) = self.find_rollout_by_rollout_id(&base_id) else {
+                if strict {
+                    return Err(ParseError::InvalidData("Native user identity: missing history base".into()));
+                }
                 tracing::debug!(
                     rollout_id = %base_id,
                     "[codex] rollout inherits from a rollout with no file here"
                 );
                 break;
             };
+            if strict && self.rollout_paths().filter(|path| {
+                RolloutFileName::parse(path).is_some_and(|name| name.rollout_id == base_id)
+            }).count() != 1 {
+                return Err(ParseError::InvalidData("Native user identity: ambiguous history base".into()));
+            }
             let base = read(&base_path)?;
             continuations.push((std::mem::replace(&mut lines, base), header_idx, cut));
         }
@@ -610,7 +635,7 @@ impl CodexParser {
                                     plan_counted = true;
                                 }
                             }
-                            "thread_goal_updated" => {
+                            "thread_goal_updated" if goal_objective.is_none() => {
                                 // Capture the first OPENING goal for the fallback,
                                 // through the SAME shared mapping the detail parser
                                 // uses — so the summary keys off exactly the objective
@@ -618,32 +643,30 @@ impl CodexParser {
                                 // `create_goal` (an active goal with an objective),
                                 // never a `goal:null` clear, a blank objective, or a
                                 // terminal-status goal.
-                                if goal_objective.is_none() {
-                                    if let Some(marker) = payload
-                                        .get("goal")
-                                        .and_then(crate::acp::codex_goal::goal_marker)
-                                    {
-                                        if marker.tool_name == "create_goal" {
-                                            // Positional, mirroring the detail parser:
-                                            // the goal opened the session iff no real
-                                            // user turn preceded it. Claim the title
-                                            // from the objective HERE, in stream order,
-                                            // so a later `user_message` can't steal it
-                                            // while a native `thread_name_updated` still
-                                            // overrides it.
-                                            goal_opens_session = !has_real_user;
-                                            if goal_opens_session && title.is_none() {
-                                                title = extract_codex_title_candidate(
-                                                    &marker.objective,
-                                                    true,
-                                                );
-                                                if title.is_some() {
-                                                    title_source_ordinal = Some(record_ordinal);
-                                                }
+                                if let Some(marker) = payload
+                                    .get("goal")
+                                    .and_then(crate::acp::codex_goal::goal_marker)
+                                {
+                                    if marker.tool_name == "create_goal" {
+                                        // Positional, mirroring the detail parser:
+                                        // the goal opened the session iff no real
+                                        // user turn preceded it. Claim the title
+                                        // from the objective HERE, in stream order,
+                                        // so a later `user_message` can't steal it
+                                        // while a native `thread_name_updated` still
+                                        // overrides it.
+                                        goal_opens_session = !has_real_user;
+                                        if goal_opens_session && title.is_none() {
+                                            title = extract_codex_title_candidate(
+                                                &marker.objective,
+                                                true,
+                                            );
+                                            if title.is_some() {
+                                                title_source_ordinal = Some(record_ordinal);
                                             }
-                                            goal_objective = Some(marker.objective);
-                                            first_goal_ordinal = Some(record_ordinal);
                                         }
+                                        goal_objective = Some(marker.objective);
+                                        first_goal_ordinal = Some(record_ordinal);
                                     }
                                 }
                             }
@@ -3068,6 +3091,15 @@ impl CodexParser {
     ) -> Result<ConversationDetail, ParseError> {
         let lines = self.rollout_lines(path)?;
 
+        self.parse_conversation_lines(path, lines, conversation_id)
+    }
+
+    fn parse_conversation_lines(
+        &self,
+        path: &Path,
+        lines: Vec<String>,
+        conversation_id: &str,
+    ) -> Result<ConversationDetail, ParseError> {
         let mut messages = Vec::new();
         let mut cwd: Option<String> = None;
         let mut parent_id: Option<String> = None;
@@ -6678,7 +6710,7 @@ fn decode_user_text(raw: &str) -> std::borrow::Cow<'_, str> {
 /// fingerprints the summary parser keeps in step with the detail parser's
 /// blocks go through this one function, so a record decodes the same on every
 /// path that compares or counts it.
-fn normalize_user_text(raw: &str) -> String {
+pub(crate) fn normalize_user_text(raw: &str) -> String {
     strip_blocked_resource_mentions(&decode_user_text(raw))
 }
 
@@ -6974,7 +7006,7 @@ mod tests {
     ///
     /// Here turn 2 was interrupted and the user sent the prompt again: the
     /// revert cut sits at turn 2's `task_started` (ordinal 5).
-    fn reverted_thread_fixture(sessions_dir: &Path, thread_id: &str, rollout_id: &str) {
+    pub(super) fn reverted_thread_fixture(sessions_dir: &Path, thread_id: &str, rollout_id: &str) {
         let rollout_dir = sessions_dir.join("2026").join("09").join("20");
         fs::create_dir_all(&rollout_dir).expect("create rollout dir");
 

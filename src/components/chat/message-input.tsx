@@ -166,6 +166,7 @@ import { useComposerShortcuts } from "@/components/chat/composer/use-composer-sh
  */
 export interface ComposerInjectContent {
   text: string
+  blocks?: PromptInputBlock[]
   skill?: { id: string; label: string }
   /**
    * How `text` lands in the composer.
@@ -780,7 +781,16 @@ export function MessageInput({
           handle.focus()
           handle.insertTextAtCursor(`${gap}${payload.text}\n\n`)
         } else {
-          handle.setText(payload.text)
+          const editor = handle.getEditor()
+          if (payload.blocks?.length && editor) {
+            hydrateFromBlocks(
+              editor,
+              payload.blocks,
+              knownInvocationsRef.current
+            )
+          } else {
+            handle.setText(payload.text)
+          }
           // Prepend the skill as the leading invocation badge, so the sent
           // message opens with `${prefix}${id}`.
           if (payload.skill) {
@@ -802,7 +812,13 @@ export function MessageInput({
       onInjectConsumed?.()
     })
     return () => cancelAnimationFrame(raf)
-  }, [injectContent, composerReady, skillPrefix, onInjectConsumed])
+  }, [
+    injectContent,
+    composerReady,
+    skillPrefix,
+    onInjectConsumed,
+    hydrateFromBlocks,
+  ])
 
   // A skill / expert badge freezes its invocation prefix (`$` for Codex, `/`
   // elsewhere) at insert time. On the welcome page users routinely click a

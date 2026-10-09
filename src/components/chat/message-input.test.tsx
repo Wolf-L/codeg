@@ -768,6 +768,32 @@ describe("MessageInput injectContent", () => {
     return { view, editor }
   }
 
+  it("restores the native edited draft's image blocks without sending", async () => {
+    const onSend = vi.fn()
+    const onInjectConsumed = vi.fn()
+    const { view, editor } = await mount({ onSend, onInjectConsumed })
+    const image = {
+      type: "image" as const,
+      data: "aGVsbG8=",
+      mime_type: "image/png",
+      uri: null,
+    }
+    view.rerender(
+      tree({
+        onSend,
+        onInjectConsumed,
+        injectContent: {
+          text: "edited",
+          blocks: [{ type: "text", text: "edited" }, image],
+        },
+      })
+    )
+    await waitFor(() => expect(onInjectConsumed).toHaveBeenCalled())
+    expect(serializeDocToText(editor.state.doc)).toBe("edited")
+    expect(screen.getByAltText(/image/i)).toBeInTheDocument()
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
   it("appends a quote after an existing draft, separated by a blank line", async () => {
     const onInjectConsumed = vi.fn()
     const { view, editor } = await mount({ onInjectConsumed })

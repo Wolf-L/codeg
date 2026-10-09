@@ -29,6 +29,8 @@ pub mod js_text;
 pub mod latest_release;
 pub mod lifecycle;
 pub mod manager;
+pub mod native_session;
+pub mod native_history;
 pub mod opencode_catalog;
 pub mod opencode_launch;
 pub mod opencode_plugins;

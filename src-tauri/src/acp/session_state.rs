@@ -245,6 +245,20 @@ pub struct PendingUserMessage {
 /// 已完成的 turn 不存在这里——它们由 parser 从 agent JSONL 读。
 #[derive(Debug)]
 pub struct SessionState {
+    /// Sanitized, negotiated native extension metadata for this connection.
+    pub native_capabilities: serde_json::Value,
+    /// A lost mutation acknowledgement requires replacing the ACP connection.
+    pub native_recovery_required: bool,
+    pub native_mutation_in_flight: bool,
+    /// Autonomous Codex queue turn, independent of a host session/prompt RPC.
+    pub native_queue_turn_id: Option<String>,
+    pub native_queue_revision: u64,
+    pub native_queue_pending: bool,
+    pub native_superseded_host_turn: bool,
+    /// Private launch-owned MCP entries (including companion credentials).
+    /// Never serialized in the client snapshot or capability response.
+    pub native_protected_mcp: Vec<agent_client_protocol::schema::v1::McpServer>,
+    pub native_history: crate::acp::native_history::NativeHistory,
     // 身份
     pub connection_id: String,
     pub conversation_id: Option<i32>,
@@ -683,6 +697,15 @@ impl SessionState {
         folder_id: Option<i32>,
     ) -> Self {
         Self {
+            native_capabilities: serde_json::json!({}),
+            native_recovery_required: false,
+            native_mutation_in_flight: false,
+            native_queue_turn_id: None,
+            native_queue_revision: 0,
+            native_queue_pending: false,
+            native_superseded_host_turn: false,
+            native_protected_mcp: Vec::new(),
+            native_history: crate::acp::native_history::NativeHistory::default(),
             connection_id,
             conversation_id: None,
             external_id: None,
@@ -788,6 +811,14 @@ impl SessionState {
     pub fn apply_event(&mut self, payload: &AcpEvent) {
         match payload {
             AcpEvent::SessionStarted { session_id } => {
+                if self.external_id.as_deref().is_some_and(|old| old != session_id) {
+                    self.native_history.clear();
+                    self.native_queue_turn_id = None;
+                    self.native_queue_pending = false;
+                    self.native_superseded_host_turn = false;
+                    self.agent_initiated_turn = false;
+                    self.native_queue_revision = self.native_queue_revision.saturating_add(1);
+                }
                 if self.external_id.as_deref() != Some(session_id.as_str()) {
                     self.external_id_changed_at = Some(std::time::SystemTime::now());
                     // The AIR task table is keyed to the session we just left.
@@ -805,7 +836,11 @@ impl SessionState {
                     self.async_task_activity_at = None;
                 }
                 self.external_id = Some(session_id.clone());
-                self.status = ConnectionStatus::Connected;
+                self.status = if self.native_queue_turn_id.is_some() {
+                    ConnectionStatus::Prompting
+                } else {
+                    ConnectionStatus::Connected
+                };
                 // Fire the dedup waiter (if any). Take()-and-send is
                 // single-shot: a duplicate SessionStarted (replay, agent
                 // re-init) finds None here and is a no-op, which is

@@ -8612,7 +8612,7 @@ fn reconcile_hermes_runtime_env_in(home: &Path) -> Result<(), AcpError> {
 
 fn agent_local_config_path(agent_type: AgentType) -> Option<PathBuf> {
     match agent_type {
-        AgentType::ClaudeCode => Some(home_dir_or_default().join(".claude").join("settings.json")),
+        AgentType::ClaudeCode => Some(crate::parsers::claude::resolve_claude_config_dir().join("settings.json")),
         AgentType::Gemini => Some(home_dir_or_default().join(".gemini").join("settings.json")),
         // Antigravity's ACP server keeps its own `settings.json` under
         // `<GEMINI_HOME>/antigravity-acp/` — a DIFFERENT file from Gemini
@@ -11221,6 +11221,26 @@ pub async fn acp_goal_control(
     manager
         .goal_control(&db.conn, &connection_id, action)
         .await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[tauri::command]
+pub async fn acp_native_capabilities(
+    connection_id: String,
+    manager: State<'_, ConnectionManager>,
+) -> Result<serde_json::Value, AcpError> {
+    manager.native_capabilities(&connection_id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[tauri::command]
+pub async fn acp_native_operation(
+    connection_id: String,
+    operation: crate::acp::native_session::NativeOperation,
+    params: serde_json::Value,
+    manager: State<'_, ConnectionManager>,
+) -> Result<serde_json::Value, AcpError> {
+    manager.native_operation(&connection_id, operation, params).await
 }
 
 /// Spawn a transient ACP connection for `agent_type` with a silent emitter,

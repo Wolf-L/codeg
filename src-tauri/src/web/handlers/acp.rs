@@ -414,6 +414,30 @@ pub async fn acp_goal_control(
     Ok(Json(()))
 }
 
+pub async fn acp_native_capabilities(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpConnectionIdParams>,
+) -> Result<Json<serde_json::Value>, AppCommandError> {
+    state.connection_manager.native_capabilities(&params.connection_id).await
+        .map(Json).map_err(|error| AppCommandError::task_execution_failed(error.to_string()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcpNativeOperationParams {
+    pub connection_id: String,
+    pub operation: crate::acp::native_session::NativeOperation,
+    pub params: serde_json::Value,
+}
+
+pub async fn acp_native_operation(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpNativeOperationParams>,
+) -> Result<Json<serde_json::Value>, AppCommandError> {
+    state.connection_manager.native_operation(&params.connection_id, params.operation, params.params).await
+        .map(Json).map_err(|error| AppCommandError::task_execution_failed(error.to_string()))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcpDescribeAgentOptionsParams {

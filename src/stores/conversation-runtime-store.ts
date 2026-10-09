@@ -329,6 +329,7 @@ type Action =
        * fork actually invalidated.
        */
       dropLiveTurnIds?: string[]
+      nativeRewind?: boolean
     }
   | {
       type: "MARK_OUT_OF_TURN_CONTENT"
@@ -1973,6 +1974,22 @@ function reducer(
         // Applied AFTER the blanket rules above so a fork's targeted removal
         // survives `preserveLive` (which is what a fork asks for: keep
         // everything except the turns it just invalidated).
+        ...(action.nativeRewind
+          ? {
+              localTurns: [],
+              optimisticTurns: [],
+              liveMessage: null,
+              backgroundTurns: [],
+              pendingBackgroundSettlements: [],
+              syncState: "idle" as const,
+              activeTurnToken: null,
+              lastTurnOwned: false,
+              liveOwnsActiveTurn: false,
+              historyAssistantBaseline: null,
+              batchBoundaryIndex: null,
+              batchBoundaryPrefixHash: null,
+            }
+          : {}),
         ...(dropIds
           ? {
               localTurns: current.localTurns.filter((t) => !dropIds.has(t.id)),
@@ -2716,6 +2733,10 @@ function reducer(
 // ─────────────────────────────────────────────────────────────────────────
 
 export interface RuntimeActions {
+  reconcileNativeRewind: (
+    conversationId: number,
+    stillCurrent: () => boolean
+  ) => Promise<void>
   fetchDetail: (conversationId: number) => void
   refetchDetail: (
     conversationId: number,
@@ -3769,6 +3790,29 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       })
   }
 
+  const reconcileNativeRewind = async (
+    conversationId: number,
+    stillCurrent: () => boolean
+  ): Promise<void> => {
+    const session = get().byConversationId.get(conversationId)
+    const generation = bumpFetchGeneration(conversationId)
+    const detail = await fetchDetailWindowed(
+      session?.dbConversationId ?? conversationId,
+      null
+    )
+    if (!stillCurrent() || !isLatestGeneration(conversationId, generation)) {
+      throw new Error("Session changed while reconciling history")
+    }
+    if (detail.in_flight_user_turn_id != null)
+      throw new Error("A new turn started; reload history before continuing")
+    dispatch({
+      type: "FETCH_DETAIL_SUCCESS",
+      conversationId,
+      detail,
+      nativeRewind: true,
+    })
+  }
+
   const refetchDetail = (
     conversationId: number,
     options?: { preserveLive?: boolean; dropLiveTurnIds?: string[] }
@@ -4197,6 +4241,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
   const actions: RuntimeActions = {
     fetchDetail,
     refetchDetail,
+    reconcileNativeRewind,
     loadOlderTurns,
     markOutOfTurnContent,
     syncViewerDetail,

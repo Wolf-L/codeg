@@ -1173,6 +1173,11 @@ pub enum SteerOutcome {
 
 /// Commands sent from Tauri command handlers to the ACP connection loop.
 pub enum ConnectionCommand {
+    NativeOperation {
+        operation: crate::acp::native_session::NativeOperation,
+        params: serde_json::Value,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, AcpError>>,
+    },
     Prompt {
         blocks: Vec<PromptInputBlock>,
         /// Pre-projected cross-client user-message broadcast (`message_id` +
@@ -3268,7 +3273,25 @@ async fn drain_permissions_then_emit(
     emitter: &EventEmitter,
     follow_up: AcpEvent,
 ) {
+    // A native queue can start its next turn before the previous host prompt's
+    // response arrives. That old response must not drain the NEW turn's cards.
+    if matches!(follow_up, AcpEvent::TurnComplete { .. })
+        && {
+            let s = state.read().await;
+            s.native_queue_turn_id.is_some() || s.native_superseded_host_turn
+        }
+    {
+        return;
+    }
     let mut queue = perms.lock().await;
+    if matches!(follow_up, AcpEvent::TurnComplete { .. })
+        && {
+            let s = state.read().await;
+            s.native_queue_turn_id.is_some() || s.native_superseded_host_turn
+        }
+    {
+        return;
+    }
     drain_permissions_locked(&mut queue, state, emitter).await;
     emit_with_state(state, emitter, follow_up).await;
 }
@@ -4209,6 +4232,148 @@ fn parse_steer_outcome(raw: &serde_json::Value) -> Result<SteerOutcome, AcpError
         other => Err(AcpError::protocol(format!(
             "unexpected _session/steering outcome: {other:?}"
         ))),
+    }
+}
+
+/// Run extension RPCs on the connection runtime so permission responses and
+/// session updates continue to flow while a native operation is pending.
+fn dispatch_native_operation(
+    cx: &ConnectionTo<Agent>,
+    sid: &SessionId,
+    state: &Arc<RwLock<SessionState>>,
+    operation: crate::acp::native_session::NativeOperation,
+    params: serde_json::Value,
+    reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, AcpError>>,
+) {
+    let cx_task = cx.clone();
+    let sid = sid.0.to_string();
+    let state = Arc::clone(state);
+    let task = async move {
+        let mutation = operation.is_mutation(&params);
+        let queue_action = (operation == crate::acp::native_session::NativeOperation::Queue)
+            .then(|| params.get("action").and_then(serde_json::Value::as_str).map(str::to_owned))
+            .flatten();
+        let requested_session = sid.clone();
+        let queue_revision = state.read().await.native_queue_revision;
+        let queue_first_page = params.get("cursor").is_none_or(serde_json::Value::is_null);
+        let prepared = {
+            let mut s = state.write().await;
+            if s.external_id.as_deref().is_some_and(|bound| bound != requested_session) {
+                Err(AcpError::protocol("Native operation session changed; reload the conversation"))
+            } else if s.native_recovery_required {
+                Err(AcpError::protocol("Native operation outcome is uncertain; reconnect before continuing"))
+            } else if s.native_mutation_in_flight {
+                Err(AcpError::protocol("A native operation is still in progress"))
+            } else if operation.requires_idle(&params)
+                && (s.turn_in_flight || s.native_queue_turn_id.is_some() || s.status == ConnectionStatus::Prompting)
+            {
+                Err(AcpError::TurnInProgress)
+            } else {
+                let result = crate::acp::native_session::prepare_request(
+                    &s.native_capabilities, s.agent_type, &sid, operation, params,
+                );
+                if result.is_ok() && mutation {
+                    s.native_mutation_in_flight = true;
+                }
+                result
+            }
+        };
+        let (method, mut params) = match prepared {
+            Ok(value) => value,
+            Err(error) => { let _ = reply.send(Err(error)); return Ok(()); }
+        };
+        if operation == crate::acp::native_session::NativeOperation::McpSet {
+            let s = state.read().await;
+            let configured = crate::commands::mcp::read_servers_for_agent_type(s.agent_type)
+                .map_err(|_| AcpError::protocol("Could not read saved MCP configuration"))
+                .and_then(|entries| entries.into_iter().map(|(name, spec)| {
+                    canonical_spec_to_mcp_server(&name, &spec)
+                        .map_err(|_| AcpError::protocol("Saved MCP configuration is invalid"))
+                }).collect::<Result<Vec<_>, _>>());
+            let protected = s.native_protected_mcp.clone();
+            drop(s);
+            let result = configured.and_then(|mut servers| {
+                let protected_names = protected.iter().filter_map(|entry| {
+                    serde_json::to_value(entry).ok()?.get("name")?.as_str().map(str::to_owned)
+                }).collect::<Vec<_>>();
+                servers.retain(|entry| {
+                    let value = serde_json::to_value(entry).unwrap_or_default();
+                    !value.get("name").and_then(serde_json::Value::as_str)
+                        .is_some_and(|name| protected_names.iter().any(|p| p == name))
+                });
+                servers.extend(protected);
+                serde_json::to_value(servers).map_err(|_| AcpError::protocol("Could not prepare MCP configuration"))
+            });
+            match result {
+                Ok(servers) => {
+                    if let Some(object) = params.as_object_mut() {
+                        object.remove("mode");
+                        object.insert("mcpServers".into(), servers);
+                    }
+                }
+                Err(error) => {
+                    state.write().await.native_mutation_in_flight = false;
+                    let _ = reply.send(Err(error));
+                    return Ok(());
+                }
+            }
+        }
+        let request = match UntypedMessage::new(method, params) {
+            Ok(request) => request,
+            Err(error) => {
+                if mutation { state.write().await.native_mutation_in_flight = false; }
+                let _ = reply.send(Err(AcpError::protocol(error.to_string())));
+                return Ok(());
+            }
+        };
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            cx_task.send_request_to(Agent, request).block_task(),
+        ).await;
+        let result = match response {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => {
+                // Transport loss and JSON-RPC errors can follow native mutation.
+                // Reconnecting is conservative; never infer an undo from error.
+                if mutation { state.write().await.native_recovery_required = true; }
+                Err(AcpError::protocol(format!("Native operation failed; reconnect before retrying: {error}")))
+            }
+            Err(_) => {
+                if mutation { state.write().await.native_recovery_required = true; }
+                Err(AcpError::protocol("Native operation timed out; outcome unknown, reconnect before continuing"))
+            }
+        };
+        if mutation && result.as_ref().is_ok_and(|value| {
+            value.get("uncertain").and_then(serde_json::Value::as_bool) == Some(true)
+                || value.get("reason").and_then(serde_json::Value::as_str)
+                    .is_some_and(|reason| reason.contains("outcome_unknown"))
+        }) {
+            state.write().await.native_recovery_required = true;
+        }
+        if operation == crate::acp::native_session::NativeOperation::Rewind
+            && result.as_ref().is_ok_and(|value| value.get("rewound").and_then(serde_json::Value::as_bool) == Some(true))
+        {
+            state.write().await.native_history.clear();
+        }
+        if let (Some(action), Ok(value)) = (queue_action.as_deref(), &result) {
+            let mut s = state.write().await;
+            if value.get("status").and_then(serde_json::Value::as_str) == Some("ok") {
+                if action == "list" && queue_first_page && queue_revision == s.native_queue_revision {
+                    if let Some(data) = value.pointer("/result/data").and_then(serde_json::Value::as_array) {
+                        s.native_queue_pending = !data.is_empty()
+                            || value.pointer("/result/nextCursor").is_some_and(|v| !v.is_null());
+                    }
+                } else if action == "add" {
+                    s.native_queue_pending = true;
+                }
+            }
+        }
+        if mutation { state.write().await.native_mutation_in_flight = false; }
+        let _ = reply.send(result);
+        Ok(())
+    };
+    if let Err(error) = cx.spawn(task) {
+        tracing::debug!("[ACP] native operation could not start: {error}");
     }
 }
 
@@ -6281,7 +6446,8 @@ async fn run_connection(
             let agent_name_for_log = registry::get_agent_meta(agent_type).name;
 
             let init_request = InitializeRequest::new(ProtocolVersion::V1)
-                .client_capabilities(build_client_capabilities(agent_type, host_tools));
+                .client_capabilities(build_client_capabilities(agent_type, host_tools))
+                .client_info(agent_client_protocol::schema::v1::Implementation::new("codeg", env!("CARGO_PKG_VERSION")));
             // Bound the Initialize handshake so an outdated / incompatible
             // cached binary that never responds can't leave the frontend
             // stuck on "Connecting...". A healthy agent answers in <1s; we
@@ -6474,6 +6640,7 @@ async fn run_connection(
             // filter needed. The returned token is stashed on the session
             // state so connection teardown can revoke it. Skipped entirely
             // for agents that don't accept MCP over the wire (above).
+            let configured_mcp_count = mcp_servers.len();
             let delegate_injection = if agent_supports_mcp && agent_delivers_wire_mcp(agent_type) {
                 if let Some(inj) = delegation_injection.as_ref() {
                     // Task-engine launches (owner label "work_task") carry the
@@ -6502,6 +6669,8 @@ async fn run_connection(
                 // that needs no tool; OpenClaw-style `supports_mcp: false`
                 // agents could ship it someday).
                 s.native_steering_available = native_steering_available;
+                s.native_capabilities = crate::acp::native_session::capabilities(init_resp.meta.as_ref());
+                s.native_protected_mcp = mcp_servers.iter().skip(configured_mcp_count).cloned().collect();
                 s.codex_user_input_shape = codex_user_input_shape;
                 s.neutral_goal_channel = neutral_goal_channel;
                 // The vocabulary is decided HERE for every adapter, advertising
@@ -6763,6 +6932,12 @@ async fn run_connection(
                             let h = emitter_clone.clone();
                             let st = Arc::clone(&state);
                             let dispatch = fix_usage_update_nulls(dispatch);
+                            observe_native_history(&st, &dispatch).await;
+                            if let Dispatch::Notification(notification) = &dispatch {
+                                if handle_native_queue_notification(&st, &h, agent_type, notification, &perms).await {
+                                    continue;
+                                }
+                            }
                             // Historical replay: a task announced in a past
                             // session is not running now, and its terminal
                             // edge may never have been recorded. Drop rather
@@ -6803,7 +6978,7 @@ async fn run_connection(
                                         )
                                         .await;
                                     }
-                                    if matches!(
+                                    if st.read().await.native_queue_turn_id.is_some() || matches!(
                                         notif.update,
                                         SessionUpdate::AvailableCommandsUpdate(_)
                                     ) {
@@ -10874,7 +11049,13 @@ async fn run_conversation_loop(
                     };
                     let h = emitter.clone();
                     let st = Arc::clone(state);
+                    observe_native_history(&st, &dispatch).await;
                     let cwd_opt = Some(cwd);
+                    if let Dispatch::Notification(notification) = &dispatch {
+                        if handle_native_queue_notification(&st, &h, agent_type, notification, perms).await {
+                            continue;
+                        }
+                    }
                     // Background work outlives the turn that started it, so
                     // these frames arrive on the IDLE loop as often as inside
                     // one.
@@ -10966,6 +11147,7 @@ async fn run_conversation_loop(
                 blocks,
                 user_message,
             }) => {
+                state.write().await.native_superseded_host_turn = false;
                 // Fingerprint the outgoing prompt for the background watcher's
                 // foreground/out-of-turn classifier BEFORE the blocks are
                 // consumed: the transcript record this prompt becomes must
@@ -11203,6 +11385,12 @@ async fn run_conversation_loop(
                             let st = Arc::clone(state);
                             let runtime = terminal_runtime.clone();
                             let session_id = sid.clone();
+                            observe_native_history(&st, &dispatch).await;
+                            if let Dispatch::Notification(notification) = &dispatch {
+                                if handle_native_queue_notification(&st, &h, agent_type, notification, perms).await {
+                                    continue;
+                                }
+                            }
                             let cwd_opt = Some(cwd);
                             // grok reports `/compact` results on ext methods
                             // that bypass the typed pipeline below and emit a
@@ -11346,6 +11534,9 @@ async fn run_conversation_loop(
                             }
                         }
                         prompt_result = &mut prompt_response => {
+                            if state.read().await.native_superseded_host_turn {
+                                break;
+                            }
                             // A rejected prompt is a TURN failure, not a dead
                             // connection: the agent answered, so it is still
                             // there, and the session it answered about is still
@@ -11826,6 +12017,9 @@ async fn run_conversation_loop(
                                     }
                                     let _ = reply.send(outcome);
                                 }
+                                Some(ConnectionCommand::NativeOperation { operation, params, reply }) => {
+                                    dispatch_native_operation(&cx, &sid, state, operation, params, reply);
+                                }
                                 Some(ConnectionCommand::StopAsyncTask {
                                     task_id,
                                     reply,
@@ -11982,14 +12176,12 @@ async fn run_conversation_loop(
                     break;
                 }
 
-                emit_with_state(
-                    state,
-                    emitter,
-                    AcpEvent::StatusChanged {
-                        status: ConnectionStatus::Connected,
-                    },
-                )
-                .await;
+                let status = if state.read().await.native_queue_turn_id.is_some() {
+                    ConnectionStatus::Prompting
+                } else {
+                    ConnectionStatus::Connected
+                };
+                emit_with_state(state, emitter, AcpEvent::StatusChanged { status }).await;
             }
             Some(ConnectionCommand::RespondPermission {
                 request_id,
@@ -12077,12 +12269,23 @@ async fn run_conversation_loop(
                     let _ = reply.send(landed);
                 }
             }
-            Some(ConnectionCommand::Steer { blocks: _, reply }) => {
+            Some(ConnectionCommand::Steer { blocks, reply }) => {
                 // Steering only means something for a RUNNING turn. Reply —
                 // never drop — so the manager's shielded task can't hang on
                 // the oneshot; the caller falls back to a normal prompt (the
                 // same reroute the frontend already has for a turn-end race).
-                let _ = reply.send(Err(AcpError::NoActiveTurn));
+                if state.read().await.native_queue_turn_id.is_some() {
+                    let cx = session.connection();
+                    let sid = session.session_id().clone();
+                    let _ = reply.send(send_steer_request(&cx, &sid, &blocks).await);
+                } else {
+                    let _ = reply.send(Err(AcpError::NoActiveTurn));
+                }
+            }
+            Some(ConnectionCommand::NativeOperation { operation, params, reply }) => {
+                let cx = session.connection();
+                let sid = session.session_id().clone();
+                dispatch_native_operation(&cx, &sid, state, operation, params, reply);
             }
             Some(ConnectionCommand::StopAsyncTask { task_id, reply }) => {
                 // Unlike Steer, this is NOT turn-scoped: background work
@@ -14616,8 +14819,13 @@ fn synthesize_native_steering(
     agent_info: Option<&agent_client_protocol::schema::v1::Implementation>,
 ) -> bool {
     init_advertises_steering(meta)
-        && registry::steering_prompt_required_min_version(agent_type)
+        && (registry::steering_prompt_required_min_version(agent_type)
             .is_some_and(|min| steering_version_ok(agent_info, min))
+            || (agent_type == AgentType::Codex
+                && meta.and_then(|m| m.get("steering"))
+                    .and_then(|v| v.get("idleBehavior"))
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("promptRequired")))))
 }
 
 /// codex-acp 1.12.0 swapped the question and the short tab header between a
@@ -16166,6 +16374,106 @@ fn is_known_ext_method(method: &str) -> bool {
     method == CLAUDE_SDK_EXT_METHOD || GROK_EXT_UPDATE_METHODS.contains(&method)
 }
 
+fn observe_native_history(state: &Arc<RwLock<SessionState>>, dispatch: &Dispatch) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let params = match dispatch {
+        Dispatch::Notification(message) if message.method() == "session/update" => Some(message.params().clone()),
+        _ => None,
+    };
+    let state = Arc::clone(state);
+    async move {
+        let Some(params) = params else { return; };
+        let mut s = state.write().await;
+        if s.agent_type != AgentType::Codex { return; }
+        if let Some(id) = params.get("sessionId").and_then(serde_json::Value::as_str) {
+            if s.external_id.as_deref().is_some_and(|bound| bound != id) { return; }
+            s.native_history.observe(&params);
+        }
+    }
+}
+
+async fn apply_native_queue_notification(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    agent_type: AgentType,
+    notification: &UntypedMessage,
+) -> bool {
+    if agent_type != AgentType::Codex
+        || !matches!(notification.method(), "_session/queue/changed" | "_session/queue/turn")
+    {
+        return false;
+    }
+    let params = notification.params();
+    let mut s = state.write().await;
+    if s.native_capabilities.pointer("/queue/version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return false;
+    }
+    let advertised_field = if notification.method() == "_session/queue/changed" { "changedNotification" } else { "turnNotification" };
+    if s.native_capabilities.get("queue").and_then(|cap| cap.get(advertised_field)).and_then(serde_json::Value::as_str) != Some(notification.method()) {
+        return false;
+    }
+    let Some(sid) = params.get("sessionId").and_then(serde_json::Value::as_str) else { return true; };
+    if s.external_id.as_deref().is_some_and(|id| id != sid) { return true; }
+    if notification.method() == "_session/queue/changed" {
+        s.native_queue_revision = s.native_queue_revision.saturating_add(1);
+        // An invalidation isn't proof of emptiness. A fresh first-page list
+        // clears this conservative admission fence.
+        s.native_queue_pending = true;
+        return true;
+    }
+    let Some(turn) = params.get("turn") else { return true; };
+    let Some(id) = turn.get("id").and_then(serde_json::Value::as_str).filter(|id| !id.trim().is_empty()) else { return true; };
+    let Some(status) = turn.get("status").and_then(serde_json::Value::as_str) else { return true; };
+    if status == "inProgress" {
+        if s.native_queue_turn_id.as_deref() == Some(id) { return true; }
+        s.native_queue_turn_id = Some(id.to_owned());
+        s.native_queue_pending = true;
+        s.native_queue_revision = s.native_queue_revision.saturating_add(1);
+        s.native_superseded_host_turn |= s.turn_in_flight;
+        s.turn_in_flight = false;
+        s.begin_agent_initiated_turn();
+        drop(s);
+        emit_with_state(state, emitter, AcpEvent::StatusChanged { status: ConnectionStatus::Prompting }).await;
+    } else if matches!(status, "completed" | "interrupted" | "failed") {
+        if s.native_queue_turn_id.as_deref() != Some(id) { return true; }
+        s.native_queue_turn_id = None;
+        s.native_queue_revision = s.native_queue_revision.saturating_add(1);
+        let reason = match status { "completed" => "end_turn", "interrupted" => "cancelled", _ => "error" };
+        drop(s);
+        emit_with_state(state, emitter, AcpEvent::TurnComplete {
+            session_id: sid.to_owned(), stop_reason: reason.to_owned(), agent_type: agent_type.to_string(),
+        }).await;
+        emit_with_state(state, emitter, AcpEvent::StatusChanged { status: ConnectionStatus::Connected }).await;
+    }
+    true
+}
+
+/// Live queue boundaries also own real permission responders. Keep admission
+/// locked until the old cards and the terminal event have both been settled.
+async fn handle_native_queue_notification(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    agent_type: AgentType,
+    notification: &UntypedMessage,
+    perms: &PendingPermissions,
+) -> bool {
+    if agent_type != AgentType::Codex || !notification.method().starts_with("_session/queue/") {
+        return false;
+    }
+    let terminal = matches!(notification.params().pointer("/turn/status").and_then(serde_json::Value::as_str),
+        Some("completed" | "failed" | "interrupted"));
+    let mut permissions = perms.lock().await;
+    let matched_terminal = {
+        let s = state.read().await;
+        terminal && notification.method() == "_session/queue/turn"
+            && s.native_capabilities.pointer("/queue/turnNotification").and_then(serde_json::Value::as_str) == Some(notification.method())
+            && s.external_id.as_deref() == notification.params().get("sessionId").and_then(serde_json::Value::as_str)
+            && s.native_queue_turn_id.is_some()
+            && s.native_queue_turn_id.as_deref() == notification.params().pointer("/turn/id").and_then(serde_json::Value::as_str)
+    };
+    if matched_terminal { drain_permissions_locked(&mut permissions, state, emitter).await; }
+    apply_native_queue_notification(state, emitter, agent_type, notification).await
+}
+
 /// Keep the text of a claude `Read` / `Grep` / `Glob` result off the raw SDK
 /// stream, for the completion frame that follows it (see
 /// `CodeBuddyLiveState::claude_viewed_results`).
@@ -16326,6 +16634,10 @@ async fn maybe_emit_ext_notification(
             return;
         }
     };
+
+    if apply_native_queue_notification(state, emitter, agent_type, &notification).await {
+        return;
+    }
 
     // The CURRENT connection status decides whether a grok `subagent_progress`
     // tick may touch the live tool call — the same Prompting predicate the
@@ -18020,6 +18332,10 @@ async fn emit_conversation_update(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "native_connection_tests.rs"]
+mod native_connection_tests;
 
 #[cfg(test)]
 mod tests {

@@ -6,6 +6,10 @@ use std::sync::OnceLock;
 use chrono::{DateTime, Utc};
 use regex::Regex;
 
+#[path = "claude_rewind.rs"]
+mod claude_rewind;
+use claude_rewind::{HistoryReader, ReplayLog, Update};
+
 use crate::models::*;
 use crate::parsers::{
     folder_name_from_path, is_safe_subagent_id, title_from_user_text, truncate_str, AgentParser,
@@ -1005,6 +1009,66 @@ pub(crate) fn find_session_file(session_id: &str) -> Option<PathBuf> {
     find_session_file_in(&resolve_claude_config_dir().join("projects"), session_id)
 }
 
+/// Exact ACP `beforeMessage` fingerprint input, read from the CURRENT retained
+/// history. Display blocks strip injected tags and whitespace and must not be
+/// hashed as native input. Array text blocks concatenate without separators,
+/// matching claude-agent-acp's `messageText`; images contribute no text.
+pub(crate) fn native_user_message_text(
+    session_id: &str,
+    message_uuid: &str,
+) -> Result<String, ParseError> {
+    let path = find_session_file(session_id)
+        .ok_or_else(|| ParseError::ConversationNotFound(session_id.to_owned()))?;
+    let (_, path) = follow_clear_rollover_chain(&path, session_id);
+    native_user_message_text_in(&path, message_uuid)
+}
+
+fn native_user_message_text_in(path: &Path, message_uuid: &str) -> Result<String, ParseError> {
+    let mut found = None;
+    for value in HistoryReader::new(fs::File::open(path)?)? {
+        let value = value?;
+        if value.get("uuid").and_then(|v| v.as_str()) == Some(message_uuid)
+            && is_human_user_record(&value)
+        {
+            found = Some(match value.pointer("/message/content") {
+                Some(serde_json::Value::String(text)) => text.clone(),
+                Some(serde_json::Value::Array(blocks)) => blocks
+                    .iter()
+                    .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+                    .collect::<String>(),
+                _ => String::new(),
+            });
+        }
+    }
+    found.ok_or_else(|| {
+        ParseError::InvalidData("Selected human message is not in retained Claude history".into())
+    })
+}
+
+fn is_human_user_record(value: &serde_json::Value) -> bool {
+    if value.get("type").and_then(|v| v.as_str()) != Some("user")
+        || is_meta_message(value)
+        || is_interrupt_marker(value)
+        || value.get("is_meta").and_then(|v| v.as_bool()) == Some(true)
+        || value.get("isSynthetic").and_then(|v| v.as_bool()) == Some(true)
+        || is_task_notification_record(value)
+        || claude_rewind::is_sidechain(value)
+        || value.get("isCompactSummary").and_then(|v| v.as_bool()) == Some(true)
+    {
+        return false;
+    }
+    match value.pointer("/message/content") {
+        Some(serde_json::Value::String(text)) => !text.starts_with(CONTEXT_CONTINUATION_PREFIX),
+        Some(serde_json::Value::Array(blocks)) => blocks.iter().any(|block| {
+            matches!(
+                block.get("type").and_then(|v| v.as_str()),
+                Some("text" | "image")
+            )
+        }),
+        _ => false,
+    }
+}
+
 /// `find_session_file` against an explicit base dir (test seam). `session_id`
 /// is embedded in a filename, so path-traversal shapes are rejected outright
 /// (`is_safe_subagent_id`: separators, `..`, drive colon, NUL).
@@ -1241,7 +1305,7 @@ impl ClaudeParser {
         path: &PathBuf,
     ) -> Result<Option<ConversationSummary>, ParseError> {
         let file = fs::File::open(path)?;
-        let reader = BufReader::new(file);
+        let reader = HistoryReader::new(file)?;
 
         let mut conversation_id: Option<String> = None;
         let mut cwd: Option<String> = None;
@@ -1254,20 +1318,8 @@ impl ClaudeParser {
         let mut last_timestamp: Option<DateTime<Utc>> = None;
         let mut message_count: u32 = 0;
 
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            let value: serde_json::Value = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
+        for value in reader {
+            let value = value?;
             let msg_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
             // Skip non-conversation entries
@@ -1495,6 +1547,8 @@ pub(crate) struct ClaudeRecordAccumulator {
     /// Session transcript path — the subagent-stats lookup resolves
     /// `<session>/subagents/agent-<id>.jsonl` relative to it.
     session_path: PathBuf,
+    rewind: ReplayLog,
+    history_error: Option<String>,
     pub(crate) messages: Vec<UnifiedMessage>,
     pub(crate) cwd: Option<String>,
     pub(crate) git_branch: Option<String>,
@@ -1575,6 +1629,8 @@ impl ClaudeRecordAccumulator {
     pub(crate) fn new(session_path: PathBuf) -> Self {
         Self {
             session_path,
+            rewind: ReplayLog::default(),
+            history_error: None,
             messages: Vec::new(),
             cwd: None,
             git_branch: None,
@@ -1672,6 +1728,8 @@ impl ClaudeRecordAccumulator {
     /// Feed one raw JSONL line. Blank and non-JSON lines are skipped, mirroring
     /// the historical `BufReader::lines()` loop (whose per-line errors were
     /// skipped via `Err(_) => continue`).
+    // Watcher supplies parsed values; tests also exercise raw chunks.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn feed_line(&mut self, line: &str) {
         if line.trim().is_empty() {
             return;
@@ -1680,10 +1738,53 @@ impl ClaudeRecordAccumulator {
             Ok(v) => v,
             Err(_) => return,
         };
-        self.feed_value(value);
+        self.feed_record(value, line.as_bytes());
     }
 
     pub(crate) fn feed_value(&mut self, value: serde_json::Value) {
+        let raw = value.to_string();
+        self.feed_record(value, raw.as_bytes());
+    }
+
+    fn feed_record(&mut self, value: serde_json::Value, raw: &[u8]) {
+        let result = self.rewind.observe(&value, raw);
+        let error = match result {
+            Ok(Update::Pass) => {
+                if self.history_error.is_none() {
+                    self.feed_projected_value(value);
+                }
+                return;
+            }
+            Ok(Update::Skip) => return,
+            Ok(Update::Rebuild) => {
+                // Rebuild the parser's derived state as well as its messages:
+                // usage ownership, thinking fragments, pending commands/goals,
+                // compaction slots and background notifications can all refer
+                // to the discarded branch. Ordinary appends never take this path.
+                let mut replay = std::mem::take(&mut self.rewind);
+                let mut next = Self::new(self.session_path.clone());
+                let result = replay.replay(|row| next.feed_projected_value(row));
+                next.rewind = replay;
+                *self = next;
+                match result {
+                    Ok(()) => return,
+                    Err(error) => error,
+                }
+            }
+            Err(error) => error,
+        };
+        // feed_line/feed_value are also used by the watcher and cannot return
+        // errors. Expose no stale messages or pending state. A later explicit
+        // anchor can repair a missing/cyclic selection; competing writes remain
+        // sticky in the index, just as the ACP reference refuses them.
+        let rewind = std::mem::take(&mut self.rewind);
+        let mut empty = Self::new(self.session_path.clone());
+        empty.rewind = rewind;
+        empty.history_error = Some(error.to_string());
+        *self = empty;
+    }
+
+    fn feed_projected_value(&mut self, value: serde_json::Value) {
         let Self {
             session_path: path,
             messages,
@@ -1706,6 +1807,7 @@ impl ClaudeRecordAccumulator {
             compaction_prompt_slot,
             compaction_summary_slot,
             seen_compaction_summary_uuids,
+            ..
         } = self;
 
         let msg_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -1807,7 +1909,7 @@ impl ClaudeRecordAccumulator {
                     messages.insert(
                         at,
                         UnifiedMessage {
-                            id: uuid,
+                            id: uuid.clone(),
                             role: MessageRole::User,
                             content: vec![ContentBlock::Text { text: display }],
                             timestamp,
@@ -1815,7 +1917,7 @@ impl ClaudeRecordAccumulator {
                             duration_ms: None,
                             model: None,
                             completed_at: Some(timestamp),
-                            agent_message_id: None,
+                            agent_message_id: (!uuid.is_empty()).then_some(uuid),
                         },
                     );
                     // Usage ownership is tracked by index, and inserting shifts
@@ -1846,7 +1948,7 @@ impl ClaudeRecordAccumulator {
                 }
                 *pending_command = Some((
                     UnifiedMessage {
-                        id: uuid,
+                        id: uuid.clone(),
                         role: MessageRole::User,
                         content: vec![ContentBlock::Text { text: display }],
                         timestamp,
@@ -1854,7 +1956,7 @@ impl ClaudeRecordAccumulator {
                         duration_ms: None,
                         model: None,
                         completed_at: Some(timestamp),
-                    agent_message_id: None,
+                        agent_message_id: (!uuid.is_empty()).then_some(uuid),
                     },
                     prompt_id,
                 ));
@@ -2035,6 +2137,10 @@ impl ClaudeRecordAccumulator {
                     }
                 }
 
+                let agent_message_id = (matches!(role, MessageRole::User)
+                    && !uuid.is_empty()
+                    && is_human_user_record(&value))
+                .then(|| uuid.clone());
                 messages.push(UnifiedMessage {
                     id: uuid,
                     role,
@@ -2044,7 +2150,7 @@ impl ClaudeRecordAccumulator {
                     duration_ms: None,
                     model: None,
                     completed_at: Some(timestamp),
-                agent_message_id: None,
+                    agent_message_id,
                 });
             }
             "assistant" => {
@@ -2485,6 +2591,9 @@ impl ClaudeRecordAccumulator {
     /// that position: nothing follows for the card to wrap, and the card belongs
     /// under the prompt that set it, which is exactly where the tail is.
     pub(crate) fn finalize_background_lifecycle(&mut self) {
+        if self.history_error.is_some() {
+            return;
+        }
         release_pending_goal(
             &mut self.messages,
             &mut self.pending_goal_open,
@@ -2512,13 +2621,10 @@ impl ClaudeParser {
         let transcript_watermark = bytes.len() as u64;
 
         let mut acc = ClaudeRecordAccumulator::new(path.clone());
-        for chunk in bytes.split(|b| *b == b'\n') {
-            // Mirror `BufReader::lines()`: a line that isn't valid UTF-8 is
-            // skipped (the old loop's per-line `Err(_) => continue`).
-            let Ok(line) = std::str::from_utf8(chunk) else {
-                continue;
-            };
-            acc.feed_line(line);
+        for value in HistoryReader::new(std::io::Cursor::new(&bytes))? {
+            // The cold reader already resolved the chain; do not spool a
+            // second copy or repeatedly rebuild at intermediate anchors.
+            acc.feed_projected_value(value?);
         }
         acc.finalize_background_lifecycle();
 
@@ -3419,7 +3525,7 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
-            agent_message_id: None,
+                agent_message_id: msg.agent_message_id.clone(),
             });
             i += 1;
         }
@@ -3435,6 +3541,257 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+
+    fn rewind_row(kind: &str, uuid: &str, parent: Option<&str>, text: &str) -> serde_json::Value {
+        json!({"type":kind,"uuid":uuid,"parentUuid":parent,"sessionId":"rewind-test",
+            "cwd":"/test/project","timestamp":"2026-10-09T00:00:00Z",
+            "message":{"role":kind,"id":format!("api-{uuid}"),"model":"claude-sonnet-4-6",
+                "content":[{"type":"text","text":text}]}})
+    }
+
+    fn rewind_anchor(leaf: Option<&str>) -> serde_json::Value {
+        json!({"type":"last-prompt","explicit":true,"leafUuid":leaf})
+    }
+
+    fn rewind_fixture() -> Vec<serde_json::Value> {
+        vec![rewind_row("user","u1",None,"first"), rewind_row("assistant","a1",Some("u1"),"answer1"),
+            rewind_row("attachment","hidden",Some("a1"),""),
+            rewind_row("user","u2",Some("hidden"),"second"), rewind_row("assistant","a2",Some("u2"),"answer2"),
+            rewind_row("user","u3",Some("a2"),"third"), rewind_row("assistant","a3",Some("u3"),"answer3")]
+    }
+
+    fn rewind_ids(turns: &[MessageTurn]) -> Vec<&str> {
+        turns.iter().filter_map(|t| t.agent_message_id.as_deref()).collect()
+    }
+
+    #[test]
+    fn rewind_first_historical_latest_and_cold_restart_match_incremental() {
+        for (leaf, expected) in [(None, vec![]), (Some("hidden"), vec!["u1","api-a1"]),
+            (Some("a2"),vec!["u1","api-a1","u2","api-a2"])] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("rewind-test.jsonl");
+            let mut rows = rewind_fixture();
+            rows.push(rewind_anchor(leaf));
+            let bytes = rows.iter().map(serde_json::Value::to_string).collect::<Vec<_>>().join("\n") + "\n";
+            fs::write(&path, &bytes).unwrap();
+            let parser = ClaudeParser::with_base_dir(dir.path().to_path_buf());
+            let mut acc = ClaudeRecordAccumulator::new(path.clone());
+            for row in &rows { acc.feed_line(&row.to_string()); }
+            assert!(acc.history_error.is_none());
+            acc.finalize_background_lifecycle();
+            let turns = group_into_turns(acc.messages);
+            assert_eq!(rewind_ids(&turns), expected);
+            for _ in 0..2 {
+                let detail = parser.parse_conversation_detail(&path, "rewind-test").unwrap();
+                assert_eq!(rewind_ids(&detail.turns), expected);
+                assert_eq!(serde_json::to_value(&detail.turns).unwrap(), serde_json::to_value(&turns).unwrap());
+                assert_eq!(detail.transcript_watermark, Some(bytes.len() as u64));
+                let summary = parser.parse_jsonl_summary(&path).unwrap().unwrap();
+                assert_eq!(summary.message_count as usize, expected.len());
+                assert_eq!(summary.title, detail.summary.title);
+            }
+            assert_eq!(fs::read(&path).unwrap(), bytes.as_bytes(), "native transcript must remain untouched");
+        }
+    }
+
+    #[test]
+    fn rewind_continuation_and_duplicate_rows_match_cold_read() {
+        for leaf in [None, Some("a1")] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("rewind-test.jsonl");
+            let mut rows = rewind_fixture();
+            let duplicate = rows[6].clone();
+            rows.extend([rewind_anchor(leaf), duplicate,
+                rewind_row("user","edited",leaf," edited \n"),
+                rewind_row("assistant","new-answer",Some("edited"),"new answer")]);
+            let mut side = rewind_row("user","side",Some("a3"),"side prompt");
+            side["parent_agent_id"] = json!("agent");
+            rows.push(side);
+            let mut acc = ClaudeRecordAccumulator::new(path.clone());
+            for row in &rows { acc.feed_value(row.clone()); }
+            assert!(acc.history_error.is_none());
+            acc.finalize_background_lifecycle();
+            fs::write(&path, rows.iter().map(serde_json::Value::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+            let detail = ClaudeParser::new().parse_conversation_detail(&path,"rewind-test").unwrap();
+            assert_eq!(serde_json::to_value(group_into_turns(acc.messages)).unwrap(), serde_json::to_value(&detail.turns).unwrap());
+            assert_eq!(rewind_ids(&detail.turns).last(), Some(&"api-new-answer"));
+            assert_eq!(native_user_message_text_in(&path,"edited").unwrap(), " edited \n");
+            assert!(native_user_message_text_in(&path,"u3").is_err());
+            assert!(native_user_message_text_in(&path,"side").is_err());
+        }
+    }
+
+    #[test]
+    fn rewind_bad_chain_errors_in_detail_summary_and_clears_watcher_state() {
+        let mut missing = rewind_fixture();
+        missing.push(rewind_anchor(Some("missing")));
+        let mut competing = rewind_fixture();
+        competing.extend([rewind_anchor(Some("a1")), rewind_row("assistant","late",Some("a3"),"stale")]);
+        let cycle = vec![rewind_row("user","loop",Some("loop"),"stale"), rewind_anchor(Some("loop"))];
+        let mut mutated = rewind_fixture();
+        mutated.extend([rewind_anchor(Some("a1")), rewind_row("assistant","a1",Some("absent"),"changed")]);
+        for rows in [missing, competing, cycle, mutated] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("rewind-test.jsonl");
+            fs::write(&path, rows.iter().map(serde_json::Value::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+            let parser = ClaudeParser::new();
+            assert!(parser.parse_conversation_detail(&path,"rewind-test").is_err());
+            assert!(parser.parse_jsonl_summary(&path).is_err());
+            let mut acc = ClaudeRecordAccumulator::new(path);
+            for row in rows { acc.feed_line(&row.to_string()); }
+            assert!(acc.history_error.is_some());
+            assert!(acc.messages.is_empty());
+            acc.feed_value(rewind_row("user","later",None,"must stay hidden"));
+            acc.finalize_background_lifecycle();
+            assert!(acc.messages.is_empty());
+        }
+    }
+
+    #[test]
+    fn rewind_resets_thinking_usage_and_pending_command_state() {
+        let mut rows = rewind_fixture();
+        let mut discarded = rewind_row("assistant","discarded",Some("a3"),"");
+        discarded["message"] = json!({"id":"shared-api","content":[{"type":"thinking","thinking":"old"}],
+            "usage":{"input_tokens":100,"output_tokens":10}});
+        rows.push(discarded);
+        rows.push(rewind_row("user","command",Some("discarded"),"<command-name>/goal</command-name><command-args>discarded</command-args>"));
+        rows.push(rewind_anchor(None));
+        let mut acc = ClaudeRecordAccumulator::new(PathBuf::from("/nonexistent.jsonl"));
+        for row in rows { acc.feed_value(row); }
+        assert!(acc.messages.is_empty());
+        assert!(acc.pending_command.is_none());
+        assert!(acc.usage_owner_by_message_id.is_empty());
+        assert!(acc.pending_assistant_message_id.is_none());
+        acc.feed_value(rewind_row("user","new",None,"new"));
+        let mut reply = rewind_row("assistant","new-reply",Some("new"),"");
+        reply["message"] = json!({"id":"shared-api","content":[{"type":"thinking","thinking":"new"}],
+            "usage":{"input_tokens":1,"output_tokens":1}});
+        acc.feed_value(reply);
+        assert_eq!(acc.messages.len(),2);
+        assert_eq!(acc.messages[1].usage.as_ref().unwrap().input_tokens,1);
+    }
+
+    #[test]
+    fn rewind_incremental_latest_anchor_recovers_missing_selection() {
+        let mut acc = ClaudeRecordAccumulator::new(PathBuf::from("/nonexistent.jsonl"));
+        for row in rewind_fixture() { acc.feed_line(&row.to_string()); }
+        acc.feed_line(&rewind_anchor(Some("missing")).to_string());
+        assert!(acc.messages.is_empty());
+        assert!(acc.history_error.is_some());
+        acc.feed_line(&rewind_anchor(Some("a1")).to_string());
+        assert!(acc.history_error.is_none());
+        assert_eq!(rewind_ids(&group_into_turns(acc.messages)), ["u1","api-a1"]);
+    }
+
+    #[test]
+    fn rewind_native_snapshot_continuation_matches_cold_detail_and_summary() {
+        // Native CLI 2.1.293: assistant -> prompt_snapshot -> old user. Rewind
+        // names the assistant, while the edited user reuses the snapshot parent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rewind-test.jsonl");
+        let mut rows = rewind_fixture();
+        rows[2]["attachment"] = json!({"type":"prompt_snapshot","systemPrompt":["context"]});
+        rows.extend([rewind_anchor(Some("a1")),
+            rewind_row("user","edited",Some("hidden"),"edited draft"),
+            rewind_row("attachment","tokens",Some("edited"),""),
+            rewind_row("assistant","reply",Some("tokens"),"edited reply")]);
+        let mut acc = ClaudeRecordAccumulator::new(path.clone());
+        let mut bytes = String::new();
+        let parser = ClaudeParser::new();
+        for (n, row) in rows.iter().enumerate() {
+            let line = row.to_string();
+            acc.feed_line(&line);
+            bytes.push_str(&line);
+            bytes.push('\n');
+            if n < 7 { continue; }
+            assert!(acc.history_error.is_none());
+            fs::write(&path, &bytes).unwrap();
+            let cold = parser.parse_conversation_detail(&path,"rewind-test").unwrap();
+            let incremental = group_into_turns(acc.messages.clone());
+            assert_eq!(serde_json::to_value(&cold.turns).unwrap(), serde_json::to_value(incremental).unwrap());
+            let summary = parser.parse_jsonl_summary(&path).unwrap().unwrap();
+            assert_eq!(summary.message_count as usize,cold.turns.len());
+            assert!(!rewind_ids(&cold.turns).iter().any(|id| ["u2","u3","api-a2","api-a3"].contains(id)));
+        }
+        assert_eq!(rewind_ids(&group_into_turns(acc.messages.clone())),["u1","api-a1","edited","api-reply"]);
+        assert_eq!(native_user_message_text_in(&path,"edited").unwrap(),"edited draft");
+        assert!(native_user_message_text_in(&path,"u2").is_err());
+        acc.feed_value(rewind_anchor(None));
+        assert!(acc.messages.is_empty());
+        assert!(acc.history_error.is_none());
+    }
+
+    #[test]
+    #[ignore = "read-only replay of an explicitly supplied isolated native E2E transcript"]
+    fn rewind_isolated_native_http_transcript() {
+        let path = PathBuf::from(std::env::var("CODEG_CLAUDE_REWIND_FIXTURE").expect("explicit isolated fixture path required"));
+        let bytes = fs::read(&path).unwrap();
+        let parser = ClaudeParser::new();
+        let detail = parser.parse_conversation_detail(&path,"isolated-native-fixture").unwrap();
+        let summary = parser.parse_jsonl_summary(&path).unwrap().unwrap();
+        let mut acc = ClaudeRecordAccumulator::new(path.clone());
+        for line in std::str::from_utf8(&bytes).unwrap().lines() { acc.feed_line(line); }
+        assert!(acc.history_error.is_none(),"{:?}",acc.history_error);
+        acc.finalize_background_lifecycle();
+        let turns = group_into_turns(acc.messages);
+        assert_eq!(serde_json::to_value(&detail.turns).unwrap(),serde_json::to_value(&turns).unwrap());
+        let texts: Vec<_> = turns.iter().flat_map(|turn| &turn.blocks).filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()), _ => None
+        }).collect();
+        assert_eq!(texts,["CLAUDE_CODE_KEEP","REPLY_CLAUDE_CODE_KEEP","CLAUDE_CODE_EDITED_DRAFT","REPLY_CLAUDE_CODE_EDITED_DRAFT"]);
+        assert_eq!(summary.message_count,4);
+        assert_eq!(fs::read(&path).unwrap(),bytes,"native transcript changed");
+    }
+
+    #[test]
+    fn rewind_incremental_retained_duplicate_replaces_payload_without_duplication() {
+        let mut acc = ClaudeRecordAccumulator::new(PathBuf::from("/nonexistent.jsonl"));
+        for row in rewind_fixture() { acc.feed_value(row); }
+        acc.feed_value(rewind_anchor(Some("a1")));
+        let replacement = rewind_row("assistant","a1",Some("u1"),"replacement");
+        acc.feed_value(replacement.clone());
+        acc.feed_value(replacement);
+        assert!(acc.history_error.is_none());
+        assert_eq!(acc.messages.len(),2);
+        assert!(matches!(&acc.messages[1].content[0], ContentBlock::Text { text } if text == "replacement"));
+        acc.feed_value(rewind_row("user","edited",Some("a1"),"continue"));
+        assert_eq!(acc.messages.len(),3);
+    }
+
+    #[test]
+    fn rewind_preserves_session_titles_and_empty_session_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rewind-test.jsonl");
+        let mut rows = rewind_fixture();
+        rows.extend([json!({"type":"custom-title","customTitle":"  Named session  "}),
+            rewind_anchor(None),json!({"type":"ai-title","aiTitle":"generated"})]);
+        fs::write(&path, rows.iter().map(serde_json::Value::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+        let parser = ClaudeParser::new();
+        let detail = parser.parse_conversation_detail(&path,"rewind-test").unwrap();
+        let summary = parser.parse_jsonl_summary(&path).unwrap().unwrap();
+        assert_eq!(summary.title.as_deref(),Some("Named session"));
+        assert_eq!(summary.title,detail.summary.title);
+        assert_eq!(summary.message_count,0);
+        assert_eq!(summary.folder_path.as_deref(),Some("/test/project"));
+        assert!(summary.model.is_none());
+    }
+
+    #[test]
+    fn rewind_raw_fingerprint_preserves_all_text_whitespace_tags_and_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rewind-test.jsonl");
+        let raw = format!("  {}\n<system-reminder>native</system-reminder>\n尾巴  ", "汉".repeat(20000));
+        let mut row = rewind_row("user","u",None,"");
+        row["message"]["content"] = json!([
+            {"type":"text","text":raw},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}},
+            {"type":"text","text":" second block\n"}]);
+        fs::write(&path,row.to_string()).unwrap();
+        assert_eq!(native_user_message_text_in(&path,"u").unwrap(), format!("{raw} second block\n"));
+        let detail = ClaudeParser::new().parse_conversation_detail(&path,"rewind-test").unwrap();
+        assert_eq!(rewind_ids(&detail.turns), ["u"]);
+        assert_eq!(detail.turns[0].blocks.len(),3);
+    }
 
     /// Build the exact frame the CLI writes: notes above the header, report
     /// below, every line indented two spaces.

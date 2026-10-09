@@ -468,6 +468,11 @@ function sameConnectRequest(a: ConnectRequest, b: ConnectRequest) {
 
 type Action =
   | {
+      type: "NATIVE_HISTORY_RECONCILED"
+      contextKey: string
+      connectionId: string
+    }
+  | {
       type: "CONNECTION_CREATED"
       contextKey: string
       connectionId: string
@@ -1678,6 +1683,22 @@ function connectionsReducer(
   action: Action
 ): ConnectionsMap {
   switch (action.type) {
+    case "NATIVE_HISTORY_RECONCILED": {
+      const current = state.get(action.contextKey)
+      if (
+        !current ||
+        current.connectionId !== action.connectionId ||
+        current.status !== "connected"
+      )
+        return state
+      const next = new Map(state)
+      next.set(action.contextKey, {
+        ...current,
+        liveMessage: null,
+        pendingUserMessage: null,
+      })
+      return next
+    }
     case "CONNECTION_CREATED": {
       const next = new Map(state)
       next.set(action.contextKey, {
@@ -3064,6 +3085,7 @@ export type LiveMessageSink = (
 ) => void
 
 export interface AcpActionsValue {
+  reconcileNativeHistory(contextKey: string, connectionId: string): void
   connect(
     contextKey: string,
     agentType: AgentType,
@@ -3994,6 +4016,17 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
     },
     []
+  )
+
+  const reconcileNativeHistory = useCallback(
+    (contextKey: string, connectionId: string) => {
+      const conn = storeRef.current.connections.get(contextKey)
+      if (conn?.connectionId !== connectionId || conn.status !== "connected")
+        throw new Error("Session changed while reconciling history")
+      discardStreamingKey(contextKey)
+      dispatch({ type: "NATIVE_HISTORY_RECONCILED", contextKey, connectionId })
+    },
+    [dispatch, discardStreamingKey]
   )
 
   const clearAcpLoadError = useCallback(
@@ -7667,6 +7700,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       registerLiveSurfaceKeys,
       registerLiveMessageSink,
       clearAcpLoadError,
+      reconcileNativeHistory,
       attachDelegationChild,
       detachDelegationChild,
       reapplyConfig,
@@ -7695,6 +7729,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       registerLiveSurfaceKeys,
       registerLiveMessageSink,
       clearAcpLoadError,
+      reconcileNativeHistory,
       attachDelegationChild,
       detachDelegationChild,
       reapplyConfig,

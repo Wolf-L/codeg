@@ -1021,6 +1021,15 @@ impl ConnectionManager {
             .map_err(|_| AcpError::ProcessExited)?;
         {
             let mut s = state_arc.write().await;
+            if s.native_recovery_required || s.native_mutation_in_flight {
+                return Err(AcpError::protocol("Native operation is busy or requires reconnection"));
+            }
+            if s.native_queue_pending {
+                return Err(AcpError::protocol("Native queue owns pending work; inspect or resume the native queue before sending"));
+            }
+            if s.native_queue_turn_id.is_some() {
+                return Err(AcpError::TurnInProgress);
+            }
             if s.turn_in_flight {
                 // Names the gate, not just the outcome: the linked path checks
                 // the same flag once before its side effects and again here, and
@@ -1179,7 +1188,13 @@ impl ConnectionManager {
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
             let (already, in_flight) = {
                 let s = conn.state.read().await;
-                (s.conversation_id.is_some(), s.turn_in_flight)
+                if s.native_recovery_required || s.native_mutation_in_flight {
+                    return Err(AcpError::protocol("Native operation is busy or requires reconnection"));
+                }
+                if s.native_queue_pending {
+                    return Err(AcpError::protocol("Native queue owns pending work; inspect or resume the native queue before sending"));
+                }
+                (s.conversation_id.is_some(), s.turn_in_flight || s.native_queue_turn_id.is_some())
             };
             (
                 conn.state.clone(),
@@ -1649,11 +1664,16 @@ impl ConnectionManager {
     }
 
     pub async fn set_mode(&self, conn_id: &str, mode_id: String) -> Result<(), AcpError> {
+        let _guard = self.clone_prompt_lock(conn_id).await?.lock_owned().await;
         let cmd_tx = {
             let connections = self.connections.lock().await;
             let conn = connections
                 .get(conn_id)
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            let state = conn.state.read().await;
+            if state.native_recovery_required || state.native_mutation_in_flight {
+                return Err(AcpError::protocol("Native operation requires reconnection or is still pending"));
+            }
             conn.cmd_tx.clone()
         };
         cmd_tx
@@ -1668,11 +1688,16 @@ impl ConnectionManager {
         config_id: String,
         value_id: String,
     ) -> Result<(), AcpError> {
+        let _guard = self.clone_prompt_lock(conn_id).await?.lock_owned().await;
         let cmd_tx = {
             let connections = self.connections.lock().await;
             let conn = connections
                 .get(conn_id)
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            let state = conn.state.read().await;
+            if state.native_recovery_required || state.native_mutation_in_flight {
+                return Err(AcpError::protocol("Native operation requires reconnection or is still pending"));
+            }
             conn.cmd_tx.clone()
         };
         cmd_tx
@@ -1773,6 +1798,116 @@ impl ConnectionManager {
             conn_id
         );
         self.cancel(db, conn_id).await
+    }
+
+    pub async fn native_capabilities(&self, conn_id: &str) -> Result<serde_json::Value, AcpError> {
+        let state = {
+            let connections = self.connections.lock().await;
+            connections.get(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?.state.clone()
+        };
+        let value = state.read().await.native_capabilities.clone();
+        Ok(value)
+    }
+
+    pub async fn native_operation(
+        &self,
+        conn_id: &str,
+        operation: crate::acp::native_session::NativeOperation,
+        mut params: serde_json::Value,
+    ) -> Result<serde_json::Value, AcpError> {
+        use crate::acp::native_session::NativeOperation;
+        let object = params.as_object().ok_or_else(|| AcpError::protocol("Native parameters must be an object"))?;
+        if object.contains_key("sessionId") || serde_json::to_vec(&params).map_or(true, |v| v.len() > 2 * 1024 * 1024) {
+            return Err(AcpError::protocol("Invalid native operation parameters"));
+        }
+        let guard = self.clone_prompt_lock(conn_id).await?.lock_owned().await;
+        let (state, cmd_tx) = {
+            let connections = self.connections.lock().await;
+            let connection = connections.get(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            (connection.state.clone(), connection.cmd_tx.clone())
+        };
+        let (agent, sid) = {
+            let s = state.read().await;
+            if s.native_recovery_required || s.native_mutation_in_flight {
+                return Err(AcpError::protocol("Native operation is busy or requires reconnection"));
+            }
+            (s.agent_type, s.external_id.clone().ok_or_else(|| AcpError::protocol("Session is not ready"))?)
+        };
+        if matches!(operation, NativeOperation::Rewind | NativeOperation::RewindFiles) {
+            let object = params.as_object_mut().ok_or_else(|| AcpError::protocol("Invalid parameters"))?;
+            let allowed = if operation == NativeOperation::Rewind { vec!["turnId", "expectedTurn"] } else { vec!["turnId", "expectedTurn", "dryRun"] };
+            if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+                return Err(AcpError::protocol("Rewind accepts a persisted turn ID, not client history guards"));
+            }
+            let turn_id = object.remove("turnId").and_then(|v| v.as_str().map(str::to_owned))
+                .ok_or_else(|| AcpError::protocol("Persisted user turn ID is required"))?;
+            let expected = object.remove("expectedTurn")
+                .ok_or_else(|| AcpError::protocol("Original message identity is required; reload history"))?;
+            let mut detail = crate::commands::conversations::get_conversation(agent, sid.clone()).await
+                .map_err(|error| AcpError::protocol(error.to_string()))?;
+            let selected = detail.turns.iter().find(|turn| turn.id == turn_id)
+                .ok_or_else(|| AcpError::protocol("Selected message is no longer in history"))?;
+            let actual = serde_json::json!({
+                "timestamp": selected.timestamp,
+                "agentMessageId": selected.agent_message_id,
+                "blocks": selected.blocks,
+            });
+            if expected != actual {
+                return Err(AcpError::protocol("Selected message changed; reload and select it again"));
+            }
+            let codex_raw = if agent == AgentType::Codex && selected.blocks.iter().all(|block| matches!(block, crate::models::message::ContentBlock::Text { .. })) {
+                let session = sid.clone();
+                let selected = selected.clone();
+                Some(tokio::task::spawn_blocking(move || {
+                    crate::parsers::codex::native_user_message_text(&session, &selected)
+                }).await.map_err(|error| AcpError::protocol(error.to_string()))?
+                    .map_err(|error| AcpError::protocol(error.to_string()))?)
+            } else { None };
+            if agent == AgentType::Codex {
+                let s = state.read().await;
+                crate::acp::native_history::enrich_codex_turns(&mut detail.turns, &s.native_history);
+            }
+            let mut points = crate::acp::native_session::resolve_rewind(&detail.turns, &turn_id, agent)?;
+            if let Some(text) = codex_raw {
+                points["beforeMessage"]["messageFingerprint"] = serde_json::json!(
+                    crate::acp::fork::fingerprint_agent_message(&text)
+                );
+            }
+            if agent == AgentType::ClaudeCode {
+                // The display parser removes host-injected tags. Hash the
+                // retained native human record, not its cleaned UI projection.
+                let native_id = points["beforeMessage"]["messageId"].as_str()
+                    .ok_or_else(|| AcpError::protocol("Native message identity is unavailable"))?.to_owned();
+                let session = sid.clone();
+                let text = tokio::task::spawn_blocking(move || {
+                    crate::parsers::claude::native_user_message_text(&session, &native_id)
+                }).await.map_err(|error| AcpError::protocol(error.to_string()))?
+                    .map_err(|error| AcpError::protocol(error.to_string()))?;
+                points["beforeMessage"]["messageFingerprint"] = serde_json::json!(
+                    crate::acp::fork::fingerprint_agent_message(&text)
+                );
+            }
+            object.insert("beforeMessage".into(), points["beforeMessage"].clone());
+            if operation == NativeOperation::Rewind {
+                if let Some(point) = points.get("resumeAtMessage") {
+                    object.insert("resumeAtMessage".into(), point.clone());
+                }
+            }
+        }
+        let capabilities = state.read().await.native_capabilities.clone();
+        crate::acp::native_session::prepare_request(&capabilities, agent, &sid, operation, params.clone())?;
+        // Once admitted, retain the prompt fence even if the HTTP window closes.
+        // The connection-scoped task owns the actual RPC and never replays it.
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            let (reply, receiver) = tokio::sync::oneshot::channel();
+            cmd_tx.send(ConnectionCommand::NativeOperation { operation, params, reply }).await
+                .map_err(|_| AcpError::ProcessExited)?;
+            receiver.await.map_err(|_| AcpError::ProcessExited)?
+        });
+        task.await.map_err(|error| AcpError::protocol(error.to_string()))?
     }
 
     /// Stop one AIR async task (`_session/async_task/stop`).
@@ -1944,6 +2079,13 @@ impl ConnectionManager {
         // back to `Cancelled`.
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let prompt_guard = prompt_lock.lock_owned().await;
+
+        {
+            let s = state_arc.read().await;
+            if s.native_recovery_required || s.native_mutation_in_flight || s.native_queue_turn_id.is_some() || s.native_queue_pending {
+                return Err(AcpError::protocol("Reconcile native operations and queue before forking"));
+            }
+        }
 
         // Link the conversation row on demand, under the prompt lock so it
         // can't race a concurrent first prompt. A conversation opened from
@@ -3042,6 +3184,9 @@ impl ConnectionManager {
         // notes to the pull path.
         let (native, tool_available) = {
             let s = state.read().await;
+            if s.native_recovery_required || s.native_mutation_in_flight {
+                return Err(AcpError::protocol("Native operation is pending or requires reconnection"));
+            }
             (s.native_steering_available, s.feedback_tool_available)
         };
         if !native && !tool_available {
@@ -3132,7 +3277,7 @@ impl ConnectionManager {
         // turn this steer was admitted against — see the re-check below.
         let admitted_turns_completed = {
             let s = state.read().await;
-            if !s.turn_in_flight {
+            if !s.turn_in_flight && s.native_queue_turn_id.is_none() {
                 return Err(AcpError::NoActiveTurn);
             }
             s.turns_completed
@@ -3170,7 +3315,7 @@ impl ConnectionManager {
                     let s = state.read().await;
                     steered_turn_changed(
                         admitted_turns_completed,
-                        s.turn_in_flight,
+                        s.turn_in_flight || s.native_queue_turn_id.is_some(),
                         s.turns_completed,
                     )
                 };

@@ -119,6 +119,50 @@ beforeEach(() => {
   mockGet.mockReset()
 })
 
+describe("native rewind reconciliation", () => {
+  it("replaces all stale overlays only after a fresh persisted read", async () => {
+    const stale = detail().turns[0]
+    seed({
+      detail: detail(),
+      localTurns: [stale],
+      backgroundTurns: [{ turn: stale, watermark: 123 }],
+      syncState: "awaiting_persist",
+    })
+    const next = { ...detail(), turns: [], turns_total: 0 }
+    mockGet.mockResolvedValue(next)
+    await actions().reconcileNativeRewind(CID, () => true)
+    expect(session()?.detail?.turns).toEqual([])
+    expect(session()?.localTurns).toEqual([])
+    expect(session()?.backgroundTurns).toEqual([])
+    expect(session()?.optimisticTurns).toEqual([])
+    expect(session()?.liveMessage).toBeNull()
+    expect(session()?.syncState).toBe("idle")
+    expect(session()?.externalId).toBe("ext-1")
+  })
+
+  it("keeps overlays on failed read and rejects a switched or newly active session", async () => {
+    const stale = detail().turns[0]
+    seed({ detail: detail(), localTurns: [stale] })
+    mockGet.mockRejectedValueOnce(new Error("read failed"))
+    await expect(
+      actions().reconcileNativeRewind(CID, () => true)
+    ).rejects.toThrow("read failed")
+    expect(session()?.localTurns).toEqual([stale])
+    mockGet.mockResolvedValue(detail())
+    await expect(
+      actions().reconcileNativeRewind(CID, () => false)
+    ).rejects.toThrow("Session changed")
+    mockGet.mockResolvedValue({
+      ...detail(),
+      in_flight_user_turn_id: "turn-new",
+    })
+    await expect(
+      actions().reconcileNativeRewind(CID, () => true)
+    ).rejects.toThrow("new turn")
+    expect(session()?.localTurns).toEqual([stale])
+  })
+})
+
 describe("markOutOfTurnContent", () => {
   it("arms the pill", () => {
     seed()

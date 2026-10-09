@@ -46,6 +46,11 @@ import {
 } from "@/lib/ask-selection-handoff"
 import { useConnectionLifecycle } from "@/hooks/use-connection-lifecycle"
 import { useMessageQueue, type QueuedMessage } from "@/hooks/use-message-queue"
+import { useNativeSession } from "@/hooks/use-native-session"
+import { nativeSupports } from "@/lib/native-session"
+import { NativeSessionTools } from "./native-session-tools"
+import { NativeQueueRecovery } from "./native-queue-recovery"
+import { NativeEditDialog } from "./native-edit-dialog"
 import { MessageListView } from "@/components/message/message-list-view"
 import {
   GoalControlProvider,
@@ -306,6 +311,7 @@ const ConversationTabView = memo(function ConversationTabView({
     completeTurn,
     markOutOfTurnContent,
     refetchDetail,
+    reconcileNativeRewind,
     syncTurnMetadata,
     setAcpLoadError,
     setDbConversationId,
@@ -647,6 +653,33 @@ const ConversationTabView = memo(function ConversationTabView({
     ),
   })
   const { status: connStatus, sessionId: connSessionId } = conn
+  const native = useNativeSession(
+    conn.connectionId,
+    connSessionId,
+    connStatus,
+    conn.isViewer
+  )
+  const nativeScope = `${conn.connectionId}:${connSessionId}`
+  const refreshNativeQueue = native.refreshQueue
+  useAcpEvent(
+    useCallback(
+      (event: EventEnvelope) => {
+        if (event.connection_id !== conn.connectionId) return
+        if (event.type === "turn_complete" || event.type === "status_changed")
+          refreshNativeQueue()
+      },
+      [conn.connectionId, refreshNativeQueue]
+    )
+  )
+  const [nativeEdit, setNativeEdit] = useState<{
+    scope: string
+    turn: MessageTurn
+  } | null>(null)
+  const nativeEditOpen = nativeEdit?.scope === nativeScope
+  const nativeInteractionBlocked =
+    native.pending || nativeEditOpen || native.nativeQueueBlocked
+  const nativeBlockedRef = useRef(nativeInteractionBlocked)
+  nativeBlockedRef.current = nativeInteractionBlocked
   const messageQueue = useMessageQueue()
   const {
     queue: msgQueue,
@@ -860,6 +893,7 @@ const ConversationTabView = memo(function ConversationTabView({
     // switched keeps the OLD agent's connection live at the same cwd until the
     // lifecycle reconnects — which, for a not-installed target, never happens.
     if (!connectionReady) return
+    if (nativeInteractionBlocked) return
     if (runtimeSyncState === "awaiting_persist") return
     // A row being inserted into the (just-ended) turn is still queued; sending
     // it now would deliver it twice. See `queueSteerInFlight`.
@@ -870,6 +904,7 @@ const ConversationTabView = memo(function ConversationTabView({
     const wait = flushRetryDelayMs(Date.now(), lastFlushBounceAtRef.current)
     const timer = setTimeout(() => {
       if (!connectionReadyRef.current) return
+      if (nativeBlockedRef.current) return
       const next = autoSendQueueRef.current()
       if (next) {
         // Mark this as the queue auto-flush: it sends the dequeued head now and,
@@ -890,7 +925,13 @@ const ConversationTabView = memo(function ConversationTabView({
     return () => clearTimeout(timer)
     // `connectionReady` subsumes connStatus, the connection's cwd and its agent,
     // so it is the only connection dependency this effect needs.
-  }, [connectionReady, runtimeSyncState, msgQueue.length, queueSteerInFlight])
+  }, [
+    connectionReady,
+    runtimeSyncState,
+    msgQueue.length,
+    queueSteerInFlight,
+    nativeInteractionBlocked,
+  ])
 
   // Mirror the connection's liveMessage into the runtime session OUTSIDE React.
   // The connection dispatch invokes this sink synchronously whenever liveMessage
@@ -1101,6 +1142,10 @@ const ConversationTabView = memo(function ConversationTabView({
       // createChatConversation, reusing this eager dir). The composer is gated
       // on `connected` for chat drafts too, so by the time we get here the agent
       // is live and the prompt is delivered inline — never parked in the queue.
+      if (nativeBlockedRef.current) {
+        mqEnqueue(draft, selectedModeIdArg ?? null)
+        return
+      }
       const sendOwnTab = ownTab
 
       if (!hasPersistedConversation && !canAutoConnect) {
@@ -2096,6 +2141,28 @@ const ConversationTabView = memo(function ConversationTabView({
     [effectiveConversationId]
   )
 
+  const handleNativeEdit = useCallback(
+    (turn: MessageTurn) => {
+      if (
+        conn.isViewer ||
+        connStatus !== "connected" ||
+        mqGetQueueLength() > 0 ||
+        native.pending ||
+        native.nativeQueueBlocked
+      )
+        return
+      setNativeEdit({ scope: nativeScope, turn })
+    },
+    [
+      conn.isViewer,
+      connStatus,
+      mqGetQueueLength,
+      native.pending,
+      native.nativeQueueBlocked,
+      nativeScope,
+    ]
+  )
+
   const messageListNode = (
     <GoalControlProvider value={goalControlValue}>
       <MessageListView
@@ -2112,6 +2179,18 @@ const ConversationTabView = memo(function ConversationTabView({
         onReload={canShowDetailErrorActions ? handleReloadDetail : undefined}
         onNewSession={
           canShowDetailErrorActions ? handleOpenNewSession : undefined
+        }
+        nativeEditDisabled={
+          nativeInteractionBlocked ||
+          msgQueue.length > 0 ||
+          connStatus !== "connected"
+        }
+        onEditUserTurn={
+          hasPersistedConversation &&
+          !conn.isViewer &&
+          nativeSupports(native.caps, "rewind")
+            ? handleNativeEdit
+            : undefined
         }
         onQuoteSelection={composerAvailable ? handleQuoteSelection : undefined}
         // Asking opens its own conversation, so it needs a folder to open it in
@@ -2238,6 +2317,31 @@ const ConversationTabView = memo(function ConversationTabView({
       getSentHistory={getSentHistory}
       topBanner={
         <>
+          <NativeQueueRecovery
+            error={native.queueReadError}
+            disabled={
+              native.pending ||
+              !["connected", "prompting"].includes(connStatus ?? "")
+            }
+            onRefresh={refreshNativeQueue}
+          />
+          {hasPersistedConversation && (
+            <NativeSessionTools
+              key={nativeScope}
+              caps={native.caps}
+              execute={native.execute}
+              disabled={
+                native.pending ||
+                nativeEditOpen ||
+                !["connected", "prompting"].includes(connStatus ?? "")
+              }
+              viewer={conn.isViewer}
+              idle={connStatus === "connected"}
+              queueSnapshot={native.queueSnapshot}
+              localQueueCount={msgQueue.length}
+              turns={detail?.turns ?? []}
+            />
+          )}
           <SessionConfigStaleBanner contextKey={tabId} />
           <PiProjectTrustBanner
             contextKey={tabId}
@@ -2339,6 +2443,44 @@ const ConversationTabView = memo(function ConversationTabView({
       }
       steerChannel={feedback.channel}
     >
+      {nativeEditOpen && nativeEdit && (
+        <NativeEditDialog
+          key={`${nativeScope}:${nativeEdit.turn.id}`}
+          turn={nativeEdit.turn}
+          execute={native.execute}
+          disabled={
+            native.pending ||
+            connStatus !== "connected" ||
+            conn.isViewer ||
+            msgQueue.length > 0 ||
+            native.nativeQueueBlocked
+          }
+          onClose={() => setNativeEdit(null)}
+          onDraft={(draft) =>
+            setComposerInject({
+              text: draft.displayText,
+              blocks: draft.blocks,
+              mode: "replace",
+            })
+          }
+          onReconcile={async () => {
+            const connectionId = conn.connectionId
+            if (!connectionId) throw new Error("Connection closed")
+            const stillCurrent = () => {
+              const current = connectionStore.getConnection(tabId)
+              return (
+                current?.connectionId === connectionId &&
+                current.sessionId === connSessionId &&
+                current.status === "connected" &&
+                !current.isViewer
+              )
+            }
+            await reconcileNativeRewind(effectiveConversationId, stillCurrent)
+            if (!stillCurrent()) throw new Error("Session changed")
+            acpActions.reconcileNativeHistory(tabId, connectionId)
+          }}
+        />
+      )}
       {isWelcomeMode ? (
         // Same overlay scrollbar as the sidebar / file lists (os-theme-codeg)
         // instead of the platform's native bar. `min-h-full` on the inner column
