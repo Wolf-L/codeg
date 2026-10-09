@@ -47,7 +47,7 @@ import {
 import { useConnectionLifecycle } from "@/hooks/use-connection-lifecycle"
 import { useMessageQueue, type QueuedMessage } from "@/hooks/use-message-queue"
 import { useNativeSession } from "@/hooks/use-native-session"
-import { nativeSupports } from "@/lib/native-session"
+import { nativeSupports, resolveNativeEditTurn } from "@/lib/native-session"
 import { NativeSessionTools } from "./native-session-tools"
 import { NativeQueueRecovery } from "./native-queue-recovery"
 import { NativeEditDialog } from "./native-edit-dialog"
@@ -2448,6 +2448,26 @@ const ConversationTabView = memo(function ConversationTabView({
           key={`${nativeScope}:${nativeEdit.turn.id}`}
           turn={nativeEdit.turn}
           execute={native.execute}
+          resolveTurn={async () => {
+            const connectionId = conn.connectionId
+            const stillCurrent = () => {
+              const current = connectionStore.getConnection(tabId)
+              return (
+                connectionId &&
+                current?.connectionId === connectionId &&
+                current.sessionId === connSessionId &&
+                current.status === "connected" &&
+                !current.isViewer
+              )
+            }
+            if (!stillCurrent()) throw new Error("Session changed")
+            const dbId =
+              getRuntimeSession(effectiveConversationId)?.dbConversationId ??
+              effectiveConversationId
+            const fresh = await getFolderConversation(dbId)
+            if (!stillCurrent()) throw new Error("Session changed")
+            return resolveNativeEditTurn(nativeEdit.turn, fresh.turns)
+          }}
           disabled={
             native.pending ||
             connStatus !== "connected" ||

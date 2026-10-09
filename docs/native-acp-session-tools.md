@@ -23,11 +23,14 @@ include Node; Git and platform system libraries remain OS prerequisites.
 
 ## Edit a previous user message
 
-The Edit action is available on eligible persisted messages when the current
+The Edit action is available on completed user messages when the current
 adapter advertises same-session rewind. Finish or stop active work and resolve
 pending queues first. Confirming rewinds the native history in the same session,
 refreshes the transcript and places the edited text/images back in the composer.
 Review and send normally. It does not create an edit fork or send automatically.
+Messages sent in the current connection can be edited without reopening the
+conversation. A client-only message is matched to a fresh full transcript by its
+exact content and send time before dispatch; missing or repeated matches are refused.
 
 The host compares the selected message with a fresh parse before dispatch and
 uses native identity/fingerprints. A stale, ambiguous or unsupported target is

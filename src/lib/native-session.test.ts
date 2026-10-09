@@ -6,6 +6,7 @@ import {
   nativeSupports,
   nativeTurnId,
   replaceQueueText,
+  resolveNativeEditTurn,
   requireNativeAck,
 } from "./native-session"
 import type { MessageTurn } from "./types"
@@ -63,6 +64,44 @@ describe("native session contracts", () => {
     expect(
       nativeTurnId({ ...turn, id: "live-123", source_turn_id: "turn-3" })
     ).toBe("turn-3")
+  })
+  it("resolves a live user independently of assistant sub-turns and refuses ambiguity", () => {
+    const live: MessageTurn = {
+      id: "optimistic-current",
+      role: "user",
+      timestamp: "2026-10-09T07:00:00.000Z",
+      blocks: [{ type: "text", text: "edit this" }],
+    }
+    const saved = {
+      ...live,
+      id: "turn-7",
+      timestamp: "2026-10-09T07:00:00.010Z",
+    }
+    const assistant: MessageTurn = {
+      ...saved,
+      role: "assistant",
+      id: "turn-6",
+    }
+    expect(resolveNativeEditTurn(live, [assistant, saved])).toBe(saved)
+    expect(() => resolveNativeEditTurn(live, [])).toThrow()
+    expect(() =>
+      resolveNativeEditTurn(live, [saved, { ...saved, id: "turn-10" }])
+    ).toThrow()
+    expect(() =>
+      resolveNativeEditTurn(live, [
+        { ...saved, timestamp: "2026-10-09T06:59:00.000Z" },
+      ])
+    ).toThrow()
+    expect(() =>
+      resolveNativeEditTurn(live, [
+        { ...saved, blocks: [{ type: "text", text: "edit this " }] },
+      ])
+    ).toThrow()
+    expect(() =>
+      resolveNativeEditTurn({ ...live, agent_message_id: "native-a" }, [
+        { ...saved, agent_message_id: "native-b" },
+      ])
+    ).toThrow()
   })
   it("keeps native queue image/mention inputs and refuses flattening annotated text", () => {
     const image = { type: "localImage" as const, path: "C:/pic.png" }

@@ -213,6 +213,37 @@ describe("native session UI", () => {
   })
 })
 describe("native edit", () => {
+  it("resolves a client turn before rewind and keeps the draft when resolution fails", async () => {
+    const execute = vi.fn().mockResolvedValue({ rewound: true })
+    const resolveTurn = vi.fn().mockRejectedValue(new Error("not saved"))
+    render(
+      <NativeEditDialog
+        turn={{ ...turn, id: "optimistic-current" }}
+        execute={execute}
+        resolveTurn={resolveTurn}
+        disabled={false}
+        onReconcile={vi.fn()}
+        onDraft={vi.fn()}
+        onClose={vi.fn()}
+      />
+    )
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "edited" },
+    })
+    fireEvent.click(screen.getByText("confirmEdit"))
+    await screen.findByRole("alert")
+    expect(resolveTurn).toHaveBeenCalledTimes(1)
+    expect(execute).not.toHaveBeenCalled()
+    expect(screen.getByRole("textbox")).toHaveValue("edited")
+    resolveTurn.mockResolvedValue(turn)
+    fireEvent.click(screen.getByText("confirmEdit"))
+    await waitFor(() =>
+      expect(execute).toHaveBeenCalledWith("rewind", {
+        turnId: "turn-1",
+        expectedTurn,
+      })
+    )
+  })
   it("retains draft/images on refusal without reconciliation or send", async () => {
     const execute = vi
       .fn()
@@ -223,6 +254,7 @@ describe("native edit", () => {
       <NativeEditDialog
         turn={turn}
         execute={execute}
+        resolveTurn={async () => turn}
         disabled={false}
         onReconcile={reconcile}
         onDraft={onDraft}
@@ -258,6 +290,7 @@ describe("native edit", () => {
       <NativeEditDialog
         turn={turn}
         execute={execute}
+        resolveTurn={async () => turn}
         disabled={false}
         onReconcile={reconcile}
         onDraft={onDraft}

@@ -23,6 +23,7 @@ export function NativeEditDialog({
   turn,
   execute,
   disabled,
+  resolveTurn,
   onReconcile,
   onDraft,
   onClose,
@@ -30,6 +31,7 @@ export function NativeEditDialog({
   turn: MessageTurn
   execute: NativeExecute
   disabled: boolean
+  resolveTurn: () => Promise<MessageTurn>
   onReconcile: () => Promise<void>
   onDraft: (draft: PromptDraft) => void
   onClose: () => void
@@ -43,17 +45,18 @@ export function NativeEditDialog({
   const draft = nativeEditDraft(turn, text)
   async function confirm() {
     if (lock.current || disabled) return
-    const turnId = nativeTurnId(turn)
-    if (!turnId) return
     lock.current = true
     setBusy(true)
     setError(null)
     try {
       if (!rewound) {
+        const target = await resolveTurn()
+        const turnId = nativeTurnId(target)
+        if (!turnId) throw new Error("User message is not saved yet")
         requireNativeAck(
           await execute("rewind", {
             turnId,
-            expectedTurn: nativeExpectedTurn(turn),
+            expectedTurn: nativeExpectedTurn(target),
           }),
           "rewound"
         )

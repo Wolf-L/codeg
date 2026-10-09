@@ -216,6 +216,31 @@ export function nativeTurnId(turn: MessageTurn): string | null {
   const id = turn.source_turn_id ?? turn.id
   return /^(?:optimistic-|live-|viewer-)/.test(id) || !id ? null : id
 }
+/** Resolve client-only user turns against a fresh full transcript, never by position. */
+export function resolveNativeEditTurn(
+  turn: MessageTurn,
+  persisted: MessageTurn[]
+): MessageTurn {
+  if (turn.role !== "user") throw new Error("Only user messages can be edited")
+  if (nativeTurnId(turn)) return turn
+  const sentAt = Date.parse(turn.timestamp)
+  const payload = JSON.stringify(turn.blocks)
+  const matches = persisted.filter(
+    (candidate) =>
+      candidate.role === "user" &&
+      nativeTurnId(candidate) &&
+      JSON.stringify(candidate.blocks) === payload
+  )
+  const match = matches.length === 1 ? matches[0] : undefined
+  if (
+    !match ||
+    !Number.isFinite(sentAt) ||
+    !(Date.parse(match.timestamp) >= sentAt) ||
+    (turn.agent_message_id && turn.agent_message_id !== match.agent_message_id)
+  )
+    throw new Error("Cannot uniquely identify the saved user message")
+  return match
+}
 export function nativeEditDraft(turn: MessageTurn, text?: string): PromptDraft {
   const original = turn.blocks
     .filter((b) => b.type === "text")

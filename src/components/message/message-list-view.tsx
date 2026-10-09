@@ -1,6 +1,5 @@
 "use client"
 
-import { nativeTurnId } from "@/lib/native-session"
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   isLiveTurnId,
@@ -966,18 +965,16 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
         ) : null}
         {group.role === "user" ? (
           <div className="group/user-msg flex w-fit ml-auto max-w-full items-start gap-1">
-            {onEditUserTurn &&
-              sourceTurns?.[0] &&
-              nativeTurnId(sourceTurns[0]) && (
-                <button
-                  type="button"
-                  className="rounded px-2 py-1 text-xs text-muted-foreground hover:bg-muted disabled:opacity-50"
-                  disabled={forkDisabled || nativeEditDisabled}
-                  onClick={() => onEditUserTurn(sourceTurns[0])}
-                >
-                  {tNative("edit")}
-                </button>
-              )}
+            {onEditUserTurn && sourceTurns?.[0] && (
+              <button
+                type="button"
+                className="rounded px-2 py-1 text-xs text-muted-foreground hover:bg-muted disabled:opacity-50"
+                disabled={forkDisabled || nativeEditDisabled}
+                onClick={() => onEditUserTurn(sourceTurns[0])}
+              >
+                {tNative("edit")}
+              </button>
+            )}
             <UserMessageTaskButton parts={group.parts} />
             <UserMessageCopyButton parts={group.parts} />
             <MessageContent>
