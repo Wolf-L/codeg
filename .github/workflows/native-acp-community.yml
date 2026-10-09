@@ -1,0 +1,89 @@
+name: Native ACP community packages
+
+on:
+  push:
+    branches: [feat/native-acp-desktop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-acp-community-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+            label: windows-x64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bundles: deb
+            label: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      HUSKY: "0"
+      NEXT_TELEMETRY_DISABLED: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "3"
+      CODEG_SKIP_SIDECAR: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install pnpm
+        run: npm install -g pnpm@11.9.0
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install Linux system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev
+      - name: Install locked frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Prepare native sidecars
+        shell: bash
+        run: |
+          unset CODEG_SKIP_SIDECAR
+          pnpm tauri:prepare-sidecars --target ${{ matrix.target }}
+      - name: Build community desktop package
+        run: pnpm tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
+      - name: Stage hashes and source identity
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib, json, shutil, subprocess
+          source = Path('src-tauri/target/${{ matrix.target }}/release/bundle')
+          out = Path('community-artifacts')
+          out.mkdir()
+          packages = list(source.rglob('*.deb')) + list(source.rglob('*setup.exe'))
+          if not packages:
+              raise SystemExit('No package produced')
+          rows=[]
+          for package in packages:
+              dest=out/package.name
+              shutil.copy2(package,dest)
+              digest=hashlib.file_digest(dest.open('rb'),'sha256').hexdigest()
+              Path(str(dest)+'.sha256').write_text(digest+'  '+dest.name+'\n')
+              rows.append({'name':dest.name,'bytes':dest.stat().st_size,'sha256':digest})
+          for name in ['native-acp-session-tools.md','native-acp-session-tools.zh-CN.md']:
+              shutil.copy2(Path('docs')/name,out/name)
+          (out/'BUILD.json').write_text(json.dumps({'commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'target':'${{ matrix.target }}','version':json.loads(Path('package.json').read_text())['version'],'packages':rows},indent=2)+'\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codeg-native-${{ matrix.label }}
+          path: community-artifacts/
+          if-no-files-found: error
+          retention-days: 14
