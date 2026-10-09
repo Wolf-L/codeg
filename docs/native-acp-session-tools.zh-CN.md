@@ -7,7 +7,7 @@
 从以下 Release 下载对应平台的独立包，并核对 SHA256：
 
 - https://github.com/Wolf-L/codex-acp/releases/tag/full-enhancements-20261009
-- https://github.com/Wolf-L/claude-agent-acp/releases/tag/full-enhancements-20261009
+- https://github.com/Wolf-L/claude-agent-acp/releases/tag/full-enhancements-20261009-r2
 
 保持整个解压目录。Windows 启动器在包根目录，Linux 在 `bin`。让 Codeg 进程的 PATH 能找到 `codex-acp` 和 `claude-agent-acp`，或使用已全局安装的完整增强版。替换后新建 ACP 连接。设置中的官方更新仍指向上游发行，不会自动安装本社区增强版。账号、服务商配置沿用原设置；便携 ACP 包附带 Node，Git 和系统库仍由系统提供。
 
@@ -22,7 +22,7 @@
 - 按实际声明展示上下文、用量、MCP、命令、Agent 和插件；Claude 完整上下文是显式操作，可能请求已配置服务商的 token-count 接口。
 - Codex 原生队列支持添加、编辑、删除、重排和启动，由原生程序持久化和派发，与 Codeg 本地输入队列区分。空闲时添加可能立即启动；取消后保留待发项，显式启动继续。当前展示前 100 项，列表不完整时禁用重排；带文本位置注解的条目不做有损编辑。
 - Claude 显示原生待发消息 ID，可撤回单条尚未开始的消息。不是持久队列，原生返回 false 不会显示成功。
-- 文件恢复与历史回退分开操作。Claude 依赖已有 checkpoint；Codex 在 Git 中撤销单个原生工具记录的文本补丁，不是全工作区快照。先预览再确认，展示实际返回路径和跳过数量，不自动重试，不承诺跨历史/文件事务。
+- 文件恢复与历史回退分开操作。Claude 依赖已有 checkpoint；新建和重新打开的连接会为后续文件工具修改开启 checkpoint，不能补建过去修改的快照。Codex 在 Git 中撤销单个原生工具记录的文本补丁，不是全工作区快照。先预览再确认，展示实际返回路径和跳过数量，不自动重试，不承诺跨历史/文件事务。
 - 可用的刷新、重连、MCP 启停和任务转后台按能力开放。“应用已保存 MCP 配置”使用 Codeg 配置并保留注入的伴生服务，遵循原生 revision 和所有权保护，不开放任意 RPC。
 - 原生归档/恢复、搜索、附件元数据和目标控制按动作协商。归档不同于本地隐藏或永久删除；解除归档后需重连以重新打开原生路由。
 

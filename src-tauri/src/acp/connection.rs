@@ -4822,6 +4822,12 @@ fn claude_raw_sdk_session_meta(
         "emitRawSDKMessages".to_string(),
         serde_json::Value::Bool(true),
     );
+    // Native file restore consumes Claude's checkpoint store. Enable snapshots
+    // for new/load/resume without opting into redundant per-turn file reports.
+    claude_code.insert(
+        "options".to_string(),
+        serde_json::json!({"enableFileCheckpointing": true}),
+    );
 
     let mut meta = serde_json::Map::new();
     meta.insert(
@@ -5007,7 +5013,9 @@ fn build_client_capabilities(
     //
     // The report exists for clients with no filesystem watcher; codeg is not
     // one. Nothing else in either release depends on it, and both adapters no-op
-    // without the advertisement, so staying out costs us nothing.
+    // without the advertisement. Native file restore separately enables the
+    // checkpoint store via session options; it does not request these reports
+    // or add a checkpoint preview to every prompt's completion path.
     //
     // codex-acp 1.7.0 and claude-agent-acp 0.73.0 have a third,
     // "nativeSubagentSessions" (the draft ACP subagent RFD; the canonical gate
@@ -22537,6 +22545,29 @@ mod tests {
         );
 
         assert!(claude_raw_sdk_session_meta(AgentType::Codex).is_none());
+    }
+
+    #[test]
+    fn claude_native_file_restore_enables_checkpoints_for_every_session_entry() {
+        let cwd = PathBuf::from("/workspace");
+        let requests = [
+            serde_json::to_value(build_new_session_request(
+                AgentType::ClaudeCode, &cwd, vec![],
+            )).unwrap(),
+            serde_json::to_value(build_load_session_request(
+                AgentType::ClaudeCode, SessionId::new("history"), &cwd, vec![],
+            )).unwrap(),
+            serde_json::to_value(build_resume_session_request(
+                AgentType::ClaudeCode, SessionId::new("history"), &cwd, vec![],
+            )).unwrap(),
+        ];
+        for request in requests {
+            assert_eq!(
+                request["_meta"]["claudeCode"]["options"]["enableFileCheckpointing"],
+                true,
+            );
+            assert_eq!(request["_meta"]["claudeCode"]["emitRawSDKMessages"], true);
+        }
     }
 
     #[test]

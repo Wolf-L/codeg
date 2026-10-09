@@ -10,7 +10,7 @@ package version.
 Download the matching Windows x64 or Linux ARM64 portable adapter from:
 
 - https://github.com/Wolf-L/codex-acp/releases/tag/full-enhancements-20261009
-- https://github.com/Wolf-L/claude-agent-acp/releases/tag/full-enhancements-20261009
+- https://github.com/Wolf-L/claude-agent-acp/releases/tag/full-enhancements-20261009-r2
 
 Verify the accompanying SHA256 and keep each extracted directory intact. Windows
 launchers are at the package root; Linux launchers are under `bin`. Make those
@@ -50,7 +50,9 @@ history, not retrying the mutation.
 - Claude's pending list exposes IDs and cancellation of one pending prompt. It
   is not a durable queue; a false cancellation reply is shown as a refusal.
 - File restore is separate from history rewind. Claude requires an existing
-  checkpoint; Codex reverses one recorded text patch tool in Git, not a whole
+  checkpoint; new and reopened Claude connections enable checkpoint capture for
+  future file-tool changes. This cannot reconstruct checkpoints for earlier changes.
+  Codex reverses one recorded text patch tool in Git, not a whole
   workspace. Preview first, confirm explicitly, and inspect actual affected and
   skipped results. No cross-history/file transaction or automatic retry exists.
 - Supported refresh/reconnect/toggle/background controls are available. Applying

@@ -57,7 +57,7 @@ jobs:
           unset CODEG_SKIP_SIDECAR
           pnpm tauri:prepare-sidecars --target ${{ matrix.target }}
       - name: Build community desktop package
-        run: pnpm tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
+        run: node node_modules/@tauri-apps/cli/tauri.js build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
       - name: Stage hashes and source identity
         shell: bash
         run: |
