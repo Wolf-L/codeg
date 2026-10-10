@@ -62,6 +62,7 @@ pub enum NativeOperation {
     RuntimeControl,
     Rewind,
     RewindFiles,
+    WorkspaceRewindFiles,
     FileRevert,
     Queue,
     McpState,
@@ -82,7 +83,7 @@ impl NativeOperation {
             Self::Queue | Self::Attachments => {
                 params.get("action").and_then(Value::as_str) != Some("list")
             }
-            Self::RewindFiles | Self::FileRevert => {
+            Self::RewindFiles | Self::FileRevert | Self::WorkspaceRewindFiles => {
                 params.get("dryRun") != Some(&Value::Bool(true))
             }
             _ => true,
@@ -586,6 +587,8 @@ pub fn prepare_request(
     }
     let codex = agent == AgentType::Codex;
     let method = match operation {
+        // Host-only operation: manager intercepts it before adapter dispatch.
+        NativeOperation::WorkspaceRewindFiles => return Err(unsupported()),
         NativeOperation::RuntimeRead => {
             let cap = advertised(caps, "runtime", "readMethod", RUNTIME_READ)?;
             let resource = string(map, "resource")?;
@@ -1000,6 +1003,16 @@ pub fn resolve_rewind(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_rewind_is_host_only_and_requires_idle_for_preview() {
+        let operation: NativeOperation = serde_json::from_value(json!("workspace_rewind_files")).unwrap();
+        assert_eq!(operation, NativeOperation::WorkspaceRewindFiles);
+        assert!(operation.requires_idle(&json!({"dryRun":true})));
+        assert!(!operation.is_mutation(&json!({"dryRun":true})));
+        assert!(operation.is_mutation(&json!({"dryRun":false})));
+        assert!(prepare_request(&json!({}), AgentType::Codex, "session", operation, json!({"dryRun":true})).is_err());
+    }
 
     fn caps() -> Value {
         let meta = json!({

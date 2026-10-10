@@ -2735,6 +2735,7 @@ function reducer(
 export interface RuntimeActions {
   reconcileNativeRewind: (
     conversationId: number,
+    removedTurn: MessageTurn,
     stillCurrent: () => boolean
   ) => Promise<void>
   fetchDetail: (conversationId: number) => void
@@ -3792,19 +3793,81 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
 
   const reconcileNativeRewind = async (
     conversationId: number,
+    removedTurn: MessageTurn,
     stillCurrent: () => boolean
   ): Promise<void> => {
     const session = get().byConversationId.get(conversationId)
-    const generation = bumpFetchGeneration(conversationId)
-    const detail = await fetchDetailWindowed(
-      session?.dbConversationId ?? conversationId,
-      null
-    )
-    if (!stillCurrent() || !isLatestGeneration(conversationId, generation)) {
+    if (!session || !stillCurrent())
       throw new Error("Session changed while reconciling history")
-    }
-    if (detail.in_flight_user_turn_id != null)
+    if (session.activeTurnToken !== null)
       throw new Error("A new turn started; reload history before continuing")
+    const generation = bumpFetchGeneration(conversationId)
+    const fetchId = session.dbConversationId ?? conversationId
+    const assertCurrent = () => {
+      const current = get().byConversationId.get(conversationId)
+      if (
+        !stillCurrent() ||
+        !isLatestGeneration(conversationId, generation) ||
+        !current ||
+        current.externalId !== session.externalId ||
+        current.dbConversationId !== session.dbConversationId
+      )
+        throw new Error("Session changed while reconciling history")
+      // A turn can start AND finish while the HTTP read is outstanding. Its
+      // token then clears, but its new buffers must still never be discarded.
+      if (
+        current.activeTurnToken !== null ||
+        current.optimisticTurns !== session.optimisticTurns ||
+        current.localTurns !== session.localTurns ||
+        current.backgroundTurns !== session.backgroundTurns ||
+        current.liveMessage !== session.liveMessage
+      )
+        throw new Error("A new turn started; reload history before continuing")
+    }
+    const removedId = removedTurn.source_turn_id ?? removedTurn.id
+    const stillContainsRemovedTurn = (detail: DbConversationDetail) =>
+      detail.turns.some(
+        (turn) =>
+          turn.role === "user" &&
+          (removedTurn.agent_message_id
+            ? turn.agent_message_id === removedTurn.agent_message_id
+            : turn.id === removedId)
+      )
+    // A native rewind acknowledgement can precede Claude's JSONL rewrite. Do
+    // not repaint the conversation with that stale parse: wait until the
+    // selected durable identity is absent from a fresh full read.
+    let detail: DbConversationDetail | null = null
+    for (const delay of [0, 75, 175, 350, 700, 1200]) {
+      assertCurrent()
+      if (delay)
+        await new Promise<void>((resolve) => setTimeout(resolve, delay))
+      assertCurrent()
+      const candidate = await getFolderConversation(fetchId)
+      assertCurrent()
+      if (
+        candidate.summary.id !== fetchId ||
+        (session.externalId !== null &&
+          candidate.summary.external_id !== session.externalId)
+      )
+        throw new Error("Session changed while reconciling history")
+      if (candidate.in_flight_user_turn_id != null)
+        throw new Error("A new turn started; reload history before continuing")
+      if (
+        (candidate.turns_offset ?? 0) !== 0 ||
+        (candidate.turns_total != null &&
+          candidate.turns_total !== candidate.turns.length)
+      )
+        throw new Error("Full history is required to confirm native rewind")
+      if (!stillContainsRemovedTurn(candidate)) {
+        detail = candidate
+        break
+      }
+    }
+    if (!detail)
+      throw new Error(
+        "Native history has not finished rewinding; reload and try again"
+      )
+    assertCurrent()
     dispatch({
       type: "FETCH_DETAIL_SUCCESS",
       conversationId,

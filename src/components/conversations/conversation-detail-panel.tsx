@@ -2447,6 +2447,7 @@ const ConversationTabView = memo(function ConversationTabView({
         <NativeEditDialog
           key={`${nativeScope}:${nativeEdit.turn.id}`}
           turn={nativeEdit.turn}
+          caps={native.caps}
           execute={native.execute}
           resolveTurn={async () => {
             const connectionId = conn.connectionId
@@ -2483,7 +2484,7 @@ const ConversationTabView = memo(function ConversationTabView({
               mode: "replace",
             })
           }
-          onReconcile={async () => {
+          onReconcile={async (rewoundTurn) => {
             const connectionId = conn.connectionId
             if (!connectionId) throw new Error("Connection closed")
             const stillCurrent = () => {
@@ -2495,7 +2496,11 @@ const ConversationTabView = memo(function ConversationTabView({
                 !current.isViewer
               )
             }
-            await reconcileNativeRewind(effectiveConversationId, stillCurrent)
+            await reconcileNativeRewind(
+              effectiveConversationId,
+              rewoundTurn,
+              stillCurrent
+            )
             if (!stillCurrent()) throw new Error("Session changed")
             acpActions.reconcileNativeHistory(tabId, connectionId)
           }}

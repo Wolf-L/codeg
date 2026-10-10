@@ -45,6 +45,12 @@ export interface NativeOperationParams {
     expectedTurn: NativeExpectedTurn
     dryRun: boolean
   }
+  workspace_rewind_files: {
+    turnId: string
+    expectedTurn: NativeExpectedTurn
+    dryRun: boolean
+    previewToken?: string
+  }
   file_revert: { toolCallId: string; dryRun: boolean; previewToken?: string }
   queue:
     | { action: "list"; cursor?: string; limit?: number }
@@ -128,6 +134,16 @@ export function nativeSupports(
         method(caps.sessionRewindFiles, "method", "_session/rewind_files") &&
         nativeRecord(caps.sessionRewindFiles).dryRun === true
       )
+    case "workspace_rewind_files":
+      return (
+        method(
+          caps.workspaceRewindFiles,
+          "method",
+          "codeg/workspace/rewind_files"
+        ) &&
+        nativeRecord(caps.workspaceRewindFiles).dryRun === true &&
+        nativeRecord(caps.workspaceRewindFiles).previewTokenRequired === true
+      )
     case "file_revert":
       return (
         method(caps.fileRevert, "method", "_session/files/revert") &&
@@ -174,7 +190,11 @@ export function nativeIsMutation(
     !["runtime_read", "mcp_state", "search"].includes(operation) &&
     !(operation === "queue" && p.action === "list") &&
     !(operation === "attachments" && p.action === "list") &&
-    !(["file_revert", "rewind_files"].includes(operation) && p.dryRun === true)
+    !(
+      ["file_revert", "rewind_files", "workspace_rewind_files"].includes(
+        operation
+      ) && p.dryRun === true
+    )
   )
 }
 export function nativeNeedsIdle(
@@ -189,6 +209,7 @@ export function nativeNeedsIdle(
     "goal",
     "rewind",
     "rewind_files",
+    "workspace_rewind_files",
     "file_revert",
     "mcp_set",
     "archive",

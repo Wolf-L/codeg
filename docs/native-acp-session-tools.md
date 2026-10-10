@@ -40,6 +40,36 @@ without a provable native message ID may require a different target; the host
 never guesses an ID. A lost acknowledgement requires reconnecting and inspecting
 history, not retrying the mutation.
 
+## Restore files while editing
+
+The edit dialog defaults to **Messages and files** when Codeg advertises workspace
+checkpoints. Preview the affected paths, then confirm. Files are restored before
+native history is rewound. **Messages only** explicitly keeps the current files.
+Codeg captures regular file bytes before and after completed host prompts, so
+command-line writes in a non-Git directory are covered too. Snapshots stay local.
+
+Only captured turns can restore files. Old turns, canceled/failed turns, attachment
+identities that cannot be proven, background/queued work and incomplete captures
+are refused. Manual changes between turns or conflicting later changes prevent a
+restore. Unrelated current files are retained. Capture is limited to 5,000 files,
+10,000 entries, 8 MiB per file and 64 MiB total. At every depth, `.git`,
+`node_modules`, `target`, `.next` and `buildcache` are excluded. Links, hard links,
+special files and unreadable files make coverage incomplete. Files outside the
+working directory, ACLs, timestamps, Git index/HEAD and empty-directory
+removal are not restored. Unix file permission bits are captured and restored. A restore spanning more than 256 prompts is refused. Each session has a 1 GiB checkpoint-storage ceiling; new captures stop before exhausting it, retaining existing evidence. There is no automatic deletion or global quota across sessions. Moving a newly created file to its backup currently requires the checkpoint store and workspace to be on the same filesystem; otherwise restoration fails and rolls back.
+
+Restoration keeps a local journal and backups; it is not an atomic filesystem
+snapshot. If application fails, Codeg attempts to undo its own writes and reports
+an uncertain outcome when that cannot be verified. Do not interpret a history-only
+rewind as evidence that files were restored. Existing messages cannot acquire a
+historical checkpoint retroactively. A durable recovery gate prevents new prompts in overlapping workspaces between file restoration and the matching history rewind. Completed restoration is rechecked against current file contents when recovering after reconnection. Concurrent or canceled work without a confirmed settled outcome invalidates checkpoint coverage.
+
+If a canceled request loses its final response, Codeg keeps its writer fence:
+reconnecting alone does not prove that tools stopped. File/history restoration
+stays unavailable in overlapping directories until the outcome is confirmed.
+The in-memory fence resets when Codeg restarts; confirm that detached tools have
+stopped before restarting. Durable restore journals remain across restarts.
+
 ## Native session tools
 
 - Context summary, usage, MCP, commands, agents and plugins appear only when
@@ -52,12 +82,10 @@ history, not retrying the mutation.
   and disables reorder for partial lists. Annotated native text is not flattened.
 - Claude's pending list exposes IDs and cancellation of one pending prompt. It
   is not a durable queue; a false cancellation reply is shown as a refusal.
-- File restore is separate from history rewind. Claude requires an existing
-  checkpoint; new and reopened Claude connections enable checkpoint capture for
-  future file-tool changes. This cannot reconstruct checkpoints for earlier changes.
-  Codex reverses one recorded text patch tool in Git, not a whole
-  workspace. Preview first, confirm explicitly, and inspect actual affected and
-  skipped results. No cross-history/file transaction or automatic retry exists.
+- The separate native file-tool panel remains available: Claude uses its native
+  checkpoint; Codex reverses one recorded text-patch tool in Git. These controls
+  do not rewind history and have narrower coverage than the edit dialog's host
+  workspace checkpoints. Preview first and inspect affected/skipped results.
 - Supported refresh/reconnect/toggle/background controls are available. Applying
   saved MCP configuration preserves Codeg's injected companion entries and uses
   the adapter's revision/ownership checks; arbitrary request payloads are not exposed.

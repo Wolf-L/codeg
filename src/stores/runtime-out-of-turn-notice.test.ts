@@ -8,8 +8,8 @@
  * response has actually re-parsed the transcript, so a failed load must leave
  * the pill standing — it is the user's only route back to that content.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest"
-import type { DbConversationDetail } from "@/lib/types"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import type { DbConversationDetail, MessageTurn } from "@/lib/types"
 import {
   resetConversationRuntimeStore,
   useConversationRuntimeStore,
@@ -120,8 +120,37 @@ beforeEach(() => {
 })
 
 describe("native rewind reconciliation", () => {
+  const removed: MessageTurn = {
+    id: "turn-2",
+    role: "user",
+    blocks: [{ type: "text", text: "UI_REMOVE" }],
+    timestamp: new Date(1_700_000_002_000).toISOString(),
+    agent_message_id: "native-remove",
+  }
+  const staleDetail = (): DbConversationDetail => ({
+    ...detail(),
+    turns: [...detail().turns, removed],
+    turns_total: 2,
+  })
+  const seedStale = () => {
+    seed({ detail: staleDetail(), localTurns: [removed] })
+    return session()
+  }
+  const deferredRead = () => {
+    let resolve!: (value: DbConversationDetail) => void
+    const pending = new Promise<DbConversationDetail>((done) => {
+      resolve = done
+    })
+    mockGet.mockReturnValueOnce(pending)
+    return resolve
+  }
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
   it("replaces all stale overlays only after a fresh persisted read", async () => {
-    const stale = detail().turns[0]
+    const stale = removed
     seed({
       detail: detail(),
       localTurns: [stale],
@@ -130,7 +159,7 @@ describe("native rewind reconciliation", () => {
     })
     const next = { ...detail(), turns: [], turns_total: 0 }
     mockGet.mockResolvedValue(next)
-    await actions().reconcileNativeRewind(CID, () => true)
+    await actions().reconcileNativeRewind(CID, stale, () => true)
     expect(session()?.detail?.turns).toEqual([])
     expect(session()?.localTurns).toEqual([])
     expect(session()?.backgroundTurns).toEqual([])
@@ -141,26 +170,294 @@ describe("native rewind reconciliation", () => {
   })
 
   it("keeps overlays on failed read and rejects a switched or newly active session", async () => {
-    const stale = detail().turns[0]
+    const stale = removed
     seed({ detail: detail(), localTurns: [stale] })
     mockGet.mockRejectedValueOnce(new Error("read failed"))
     await expect(
-      actions().reconcileNativeRewind(CID, () => true)
+      actions().reconcileNativeRewind(CID, stale, () => true)
     ).rejects.toThrow("read failed")
     expect(session()?.localTurns).toEqual([stale])
     mockGet.mockResolvedValue(detail())
     await expect(
-      actions().reconcileNativeRewind(CID, () => false)
+      actions().reconcileNativeRewind(CID, stale, () => false)
     ).rejects.toThrow("Session changed")
     mockGet.mockResolvedValue({
       ...detail(),
       in_flight_user_turn_id: "turn-new",
     })
     await expect(
-      actions().reconcileNativeRewind(CID, () => true)
+      actions().reconcileNativeRewind(CID, stale, () => true)
     ).rejects.toThrow("new turn")
     expect(session()?.localTurns).toEqual([stale])
   })
+
+  it("polls stale full reads without repainting, then commits the rewound prefix", async () => {
+    vi.useFakeTimers()
+    const before = seedStale()
+    mockGet
+      .mockResolvedValueOnce(staleDetail())
+      .mockResolvedValueOnce(staleDetail())
+      .mockResolvedValueOnce(detail())
+    const pending = actions().reconcileNativeRewind(CID, removed, () => true)
+    await flush()
+    expect(session()).toBe(before)
+    await vi.advanceTimersByTimeAsync(74)
+    expect(mockGet).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(mockGet).toHaveBeenCalledTimes(2)
+    expect(session()).toBe(before)
+    await vi.advanceTimersByTimeAsync(175)
+    await pending
+    expect(mockGet.mock.calls).toEqual([[CID], [CID], [CID]])
+    expect(session()?.detail?.turns).toEqual(detail().turns)
+    expect(session()?.localTurns).toEqual([])
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it("times out after the bounded stale reads without clearing any overlays", async () => {
+    vi.useFakeTimers()
+    const before = seedStale()
+    mockGet.mockResolvedValue(staleDetail())
+    const pending = actions().reconcileNativeRewind(CID, removed, () => true)
+    const rejection = expect(pending).rejects.toThrow(
+      "Native history has not finished rewinding"
+    )
+    await vi.runAllTimersAsync()
+    await rejection
+    expect(mockGet).toHaveBeenCalledTimes(6)
+    expect(session()).toBe(before)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it("matches a removed native ID even when its parser position changed", async () => {
+    vi.useFakeTimers()
+    seedStale()
+    mockGet
+      .mockResolvedValueOnce({
+        ...detail(),
+        turns: [{ ...removed, id: "turn-99" }],
+      })
+      .mockResolvedValueOnce(detail())
+    const pending = actions().reconcileNativeRewind(CID, removed, () => true)
+    await flush()
+    expect(session()?.localTurns).toEqual([removed])
+    await vi.runAllTimersAsync()
+    await pending
+    expect(mockGet).toHaveBeenCalledTimes(2)
+  })
+
+  it("uses source_turn_id for targets without a native ID and fetches the bound DB row", async () => {
+    vi.useFakeTimers()
+    const target = {
+      ...removed,
+      id: "live-42",
+      source_turn_id: "turn-2",
+      agent_message_id: undefined,
+    }
+    seed({ dbConversationId: 99, localTurns: [target] })
+    const next = { ...detail(), summary: { ...detail().summary, id: 99 } }
+    mockGet
+      .mockResolvedValueOnce({
+        ...next,
+        turns: [{ ...removed, agent_message_id: undefined }],
+      })
+      .mockResolvedValueOnce(next)
+    const pending = actions().reconcileNativeRewind(CID, target, () => true)
+    await vi.runAllTimersAsync()
+    await pending
+    expect(mockGet.mock.calls).toEqual([[99], [99]])
+    expect(session()?.dbConversationId).toBe(99)
+  })
+
+  it("rejects a session switch during a read without repainting or polling again", async () => {
+    vi.useFakeTimers()
+    const before = seedStale()
+    const resolve = deferredRead()
+    let current = true
+    const pending = actions().reconcileNativeRewind(CID, removed, () => current)
+    const rejection = expect(pending).rejects.toThrow("Session changed")
+    current = false
+    resolve(staleDetail())
+    await rejection
+    expect(session()).toBe(before)
+    expect(mockGet).toHaveBeenCalledTimes(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it("stops before the next read when the session switches during backoff", async () => {
+    vi.useFakeTimers()
+    const before = seedStale()
+    mockGet.mockResolvedValue(staleDetail())
+    let current = true
+    const pending = actions().reconcileNativeRewind(CID, removed, () => current)
+    const rejection = expect(pending).rejects.toThrow("Session changed")
+    await flush()
+    current = false
+    await vi.runAllTimersAsync()
+    await rejection
+    expect(mockGet).toHaveBeenCalledTimes(1)
+    expect(session()).toBe(before)
+  })
+
+  it("abandons a superseded read immediately and preserves the newer detail", async () => {
+    vi.useFakeTimers()
+    seedStale()
+    const resolve = deferredRead()
+    const pending = actions().reconcileNativeRewind(CID, removed, () => true)
+    const rejection = expect(pending).rejects.toThrow("Session changed")
+    const newer = detail()
+    mockGet.mockResolvedValueOnce(newer)
+    actions().refetchDetail(CID, { preserveLive: true })
+    await flush()
+    const before = session()
+    resolve(staleDetail())
+    await rejection
+    expect(session()).toBe(before)
+    expect(session()?.detail).toBe(newer)
+    expect(mockGet).toHaveBeenCalledTimes(2)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it("does not invalidate another pending fetch when already switched away", async () => {
+    seedStale()
+    const resolve = deferredRead()
+    actions().refetchDetail(CID)
+    await expect(
+      actions().reconcileNativeRewind(CID, removed, () => false)
+    ).rejects.toThrow("Session changed")
+    const next = detail()
+    resolve(next)
+    await flush()
+    expect(session()?.detail).toBe(next)
+    expect(mockGet).toHaveBeenCalledTimes(1)
+  })
+
+  it("stops a superseded poll during backoff before making another request", async () => {
+    vi.useFakeTimers()
+    seedStale()
+    mockGet.mockResolvedValueOnce(staleDetail()).mockResolvedValueOnce(detail())
+    const pending = actions().reconcileNativeRewind(CID, removed, () => true)
+    const rejection = expect(pending).rejects.toThrow("Session changed")
+    await flush()
+    actions().refetchDetail(CID, { preserveLive: true })
+    await flush()
+    const before = session()
+    await vi.runAllTimersAsync()
+    await rejection
+    expect(mockGet).toHaveBeenCalledTimes(2)
+    expect(session()).toBe(before)
+  })
+
+  it("does not resurrect a removed session", async () => {
+    seedStale()
+    const resolve = deferredRead()
+    const pending = actions().reconcileNativeRewind(CID, removed, () => true)
+    const rejection = expect(pending).rejects.toThrow("Session changed")
+    actions().removeConversation(CID)
+    resolve(detail())
+    await rejection
+    expect(session()).toBeUndefined()
+  })
+
+  it.each(["external", "binding"])(
+    "rejects a runtime %s identity change during the read",
+    async (kind) => {
+      seedStale()
+      const resolve = deferredRead()
+      const pending = actions().reconcileNativeRewind(CID, removed, () => true)
+      const rejection = expect(pending).rejects.toThrow("Session changed")
+      if (kind === "external") actions().setExternalId(CID, "other-session")
+      else actions().setDbConversationId(CID, 99)
+      const before = session()
+      resolve(detail())
+      await rejection
+      expect(session()).toBe(before)
+    }
+  )
+
+  it("rejects an in-flight response even if the removed target is still present", async () => {
+    vi.useFakeTimers()
+    const before = seedStale()
+    mockGet.mockResolvedValue({
+      ...staleDetail(),
+      in_flight_user_turn_id: "new-turn",
+    })
+    await expect(
+      actions().reconcileNativeRewind(CID, removed, () => true)
+    ).rejects.toThrow("new turn")
+    expect(session()).toBe(before)
+    expect(mockGet).toHaveBeenCalledTimes(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it("refuses an already active local turn before fetching", async () => {
+    seed({ activeTurnToken: "running", localTurns: [removed] })
+    const before = session()
+    await expect(
+      actions().reconcileNativeRewind(CID, removed, () => true)
+    ).rejects.toThrow("new turn")
+    expect(mockGet).not.toHaveBeenCalled()
+    expect(session()).toBe(before)
+  })
+
+  it("preserves background turns received while the read is outstanding", async () => {
+    seedStale()
+    const resolve = deferredRead()
+    const pending = actions().reconcileNativeRewind(CID, removed, () => true)
+    const rejection = expect(pending).rejects.toThrow("new turn")
+    actions().applyBackgroundActivity(CID, detail().turns, 500)
+    const before = session()
+    resolve(detail())
+    await rejection
+    expect(session()).toBe(before)
+  })
+
+  it.each([false, true])(
+    "preserves a new local turn despite a stale idle HTTP response (completed=%s)",
+    async (completed) => {
+      seedStale()
+      const resolve = deferredRead()
+      const pending = actions().reconcileNativeRewind(CID, removed, () => true)
+      const rejection = expect(pending).rejects.toThrow("new turn")
+      actions().appendOptimisticTurn(
+        CID,
+        { ...removed, id: "optimistic-new" },
+        "token-new"
+      )
+      if (completed) actions().completeTurn(CID)
+      const before = session()
+      resolve(detail())
+      await rejection
+      expect(session()).toBe(before)
+    }
+  )
+
+  it.each([
+    { ...detail(), summary: { ...detail().summary, external_id: "other" } },
+    { ...detail(), summary: { ...detail().summary, id: 99 } },
+  ])("rejects history belonging to another session", async (candidate) => {
+    const before = seedStale()
+    mockGet.mockResolvedValue(candidate)
+    await expect(
+      actions().reconcileNativeRewind(CID, removed, () => true)
+    ).rejects.toThrow("Session changed")
+    expect(session()).toBe(before)
+  })
+
+  it.each([
+    { ...detail(), turns_offset: 10, turns_total: 11 },
+    { ...detail(), turns_offset: 0, turns_total: 10 },
+  ])(
+    "does not treat absence from a partial window as a rewind",
+    async (candidate) => {
+      const before = seedStale()
+      mockGet.mockResolvedValue(candidate)
+      await expect(
+        actions().reconcileNativeRewind(CID, removed, () => true)
+      ).rejects.toThrow("Full history")
+      expect(session()).toBe(before)
+    }
+  )
 })
 
 describe("markOutOfTurnContent", () => {

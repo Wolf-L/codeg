@@ -213,6 +213,141 @@ describe("native session UI", () => {
   })
 })
 describe("native edit", () => {
+  const workspaceCaps = {
+    workspaceRewindFiles: {
+      version: 1,
+      method: "codeg/workspace/rewind_files",
+      dryRun: true,
+      previewTokenRequired: true,
+    },
+  }
+  it("previews and restores files before rewinding history, without reapplying after a history refusal", async () => {
+    const execute = vi
+      .fn()
+      .mockResolvedValueOnce({
+        canRevert: true,
+        previewToken: "sha256:preview",
+        paths: ["answer.txt"],
+      })
+      .mockResolvedValueOnce({ reverted: true, paths: ["answer.txt"] })
+      .mockResolvedValueOnce({ rewound: false, reason: "stale history" })
+      .mockResolvedValueOnce({ rewound: true })
+    const onDraft = vi.fn()
+    render(
+      <NativeEditDialog
+        turn={turn}
+        caps={workspaceCaps}
+        execute={execute}
+        resolveTurn={async () => turn}
+        disabled={false}
+        onReconcile={async () => undefined}
+        onDraft={onDraft}
+        onClose={vi.fn()}
+      />
+    )
+    expect(screen.getByText("confirmFilesAndHistory")).toBeDisabled()
+    fireEvent.click(screen.getByText("preview"))
+    await screen.findByText("answer.txt")
+    fireEvent.click(screen.getByText("confirmFilesAndHistory"))
+    await screen.findByRole("alert")
+    expect(execute.mock.calls.map((c) => c[0])).toEqual([
+      "workspace_rewind_files",
+      "workspace_rewind_files",
+      "rewind",
+    ])
+    expect(execute.mock.calls[1][1]).toEqual({
+      turnId: turn.id,
+      expectedTurn,
+      dryRun: false,
+      previewToken: "sha256:preview",
+    })
+    expect(onDraft).not.toHaveBeenCalled()
+    expect(screen.getByText("filesBeforeHistory")).toBeVisible()
+    fireEvent.click(screen.getByText("confirmEdit"))
+    await waitFor(() => expect(onDraft).toHaveBeenCalledTimes(1))
+    expect(execute.mock.calls.map((c) => c[0])).toEqual([
+      "workspace_rewind_files",
+      "workspace_rewind_files",
+      "rewind",
+      "rewind",
+    ])
+  })
+  it("does not rewind history after a file conflict or an unknown file outcome", async () => {
+    const execute = vi
+      .fn()
+      .mockResolvedValueOnce({
+        canRevert: true,
+        previewToken: "sha256:preview",
+        paths: ["answer.txt"],
+      })
+      .mockResolvedValueOnce({ reverted: false, reason: "file_conflict" })
+      .mockResolvedValueOnce({
+        canRevert: true,
+        previewToken: "sha256:fresh",
+        paths: ["answer.txt"],
+      })
+      .mockRejectedValueOnce(new Error("transport lost"))
+    render(
+      <NativeEditDialog
+        turn={turn}
+        caps={workspaceCaps}
+        execute={execute}
+        resolveTurn={async () => turn}
+        disabled={false}
+        onReconcile={vi.fn()}
+        onDraft={vi.fn()}
+        onClose={vi.fn()}
+      />
+    )
+    fireEvent.click(screen.getByText("preview"))
+    await waitFor(() =>
+      expect(screen.getByText("confirmFilesAndHistory")).not.toBeDisabled()
+    )
+    fireEvent.click(screen.getByText("confirmFilesAndHistory"))
+    await screen.findByRole("alert")
+    expect(execute).toHaveBeenCalledTimes(2)
+    expect(screen.getByText("confirmFilesAndHistory")).toBeDisabled()
+    fireEvent.click(screen.getByText("preview"))
+    await waitFor(() =>
+      expect(screen.getByText("confirmFilesAndHistory")).not.toBeDisabled()
+    )
+    fireEvent.click(screen.getByText("confirmFilesAndHistory"))
+    await screen.findByRole("alert")
+    expect(execute).toHaveBeenCalledTimes(4)
+    expect(screen.getByText("confirmFilesAndHistory")).toBeDisabled()
+    expect(
+      execute.mock.calls.every((c) => c[0] === "workspace_rewind_files")
+    ).toBe(true)
+  })
+  it("allows explicitly keeping files when a historical checkpoint is missing", async () => {
+    const execute = vi
+      .fn()
+      .mockResolvedValueOnce({ canRevert: false, reason: "checkpoint_missing" })
+      .mockResolvedValueOnce({ rewound: true })
+    const onDraft = vi.fn()
+    render(
+      <NativeEditDialog
+        turn={turn}
+        caps={workspaceCaps}
+        execute={execute}
+        resolveTurn={async () => turn}
+        disabled={false}
+        onReconcile={async () => undefined}
+        onDraft={onDraft}
+        onClose={vi.fn()}
+      />
+    )
+    fireEvent.click(screen.getByText("preview"))
+    await screen.findByText("checkpoint_missing")
+    expect(screen.getByText("confirmFilesAndHistory")).toBeDisabled()
+    fireEvent.click(screen.getByRole("radio", { name: "historyOnly" }))
+    fireEvent.click(screen.getByText("confirmEdit"))
+    await waitFor(() => expect(onDraft).toHaveBeenCalledTimes(1))
+    expect(execute.mock.calls.map((c) => c[0])).toEqual([
+      "workspace_rewind_files",
+      "rewind",
+    ])
+  })
   it("resolves a client turn before rewind and keeps the draft when resolution fails", async () => {
     const execute = vi.fn().mockResolvedValue({ rewound: true })
     const resolveTurn = vi.fn().mockRejectedValue(new Error("not saved"))
@@ -222,7 +357,7 @@ describe("native edit", () => {
         execute={execute}
         resolveTurn={resolveTurn}
         disabled={false}
-        onReconcile={vi.fn()}
+        onReconcile={async () => undefined}
         onDraft={vi.fn()}
         onClose={vi.fn()}
       />
@@ -256,7 +391,7 @@ describe("native edit", () => {
         execute={execute}
         resolveTurn={async () => turn}
         disabled={false}
-        onReconcile={reconcile}
+        onReconcile={async () => reconcile()}
         onDraft={onDraft}
         onClose={vi.fn()}
       />
@@ -292,7 +427,7 @@ describe("native edit", () => {
         execute={execute}
         resolveTurn={async () => turn}
         disabled={false}
-        onReconcile={reconcile}
+        onReconcile={async () => reconcile()}
         onDraft={onDraft}
         onClose={vi.fn()}
       />

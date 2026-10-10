@@ -824,6 +824,9 @@ mod tests {
 
     #[test]
     fn supported_agents_are_nonempty_and_skill_capable() {
+        // Other tests replace the process-wide custom registry. Keep this
+        // multi-read assertion on one registry generation, like its writers.
+        let _guard = crate::acp::custom_registry::hydrate_test_guard();
         let agents = supported_agents();
         assert!(!agents.is_empty());
         assert!(agents.iter().all(|a| skill_storage_spec(*a).is_some()));

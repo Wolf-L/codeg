@@ -2037,14 +2037,15 @@ mod tests {
     #[tokio::test]
     async fn linked_chat_prompt_enqueues_initial_task_prompt() {
         let db = fresh_in_memory_db().await;
-        let folder_id = seed_folder(&db, "/tmp/codeg-topic-linked-prompt").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let conv_id = seed_conversation(&db, folder_id, AgentType::OpenCode).await;
         let conn_mgr = ConnectionManager::new();
         let mut rx = conn_mgr
             .insert_test_connection_live(
                 "conn-linked",
                 AgentType::OpenCode,
-                Some(std::path::PathBuf::from("/tmp/codeg-topic-linked-prompt")),
+                Some(workspace.path().to_path_buf()),
                 EventEmitter::Noop,
             )
             .await;
@@ -2060,7 +2061,9 @@ mod tests {
         .await
         .expect("linked prompt send");
 
-        let command = rx.recv().await.expect("prompt command");
+        let command = rx
+            .try_recv()
+            .expect("prompt command enqueued before send returned");
         let ConnectionCommand::Prompt { blocks, .. } = command else {
             panic!("expected prompt command");
         };
@@ -2074,7 +2077,8 @@ mod tests {
     async fn topic_followup_uses_active_bound_session() {
         let db = fresh_in_memory_db().await;
         let channel_id = seed_chat_channel(&db).await;
-        let folder_id = seed_folder(&db, "/tmp/codeg-topic-followup-active").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let conv_id = seed_conversation(&db, folder_id, AgentType::OpenCode).await;
         let target = ChannelMessageTarget::telegram_forum_topic(channel_id, "-100123", "2");
         thread_binding_service::upsert_for_target(
@@ -2093,7 +2097,7 @@ mod tests {
             .insert_test_connection_live(
                 "conn-followup",
                 AgentType::OpenCode,
-                Some(std::path::PathBuf::from("/tmp/codeg-topic-followup-active")),
+                Some(workspace.path().to_path_buf()),
                 EventEmitter::Noop,
             )
             .await;
@@ -2133,7 +2137,9 @@ mod tests {
         .await;
 
         assert_eq!(message.body, i18n::message_sent(Lang::En));
-        let command = rx.recv().await.expect("prompt command");
+        let command = rx
+            .try_recv()
+            .expect("prompt command enqueued before send returned");
         let ConnectionCommand::Prompt { blocks, .. } = command else {
             panic!("expected prompt command");
         };

@@ -198,14 +198,21 @@ class Provider:
                                 item["namespace"] = namespace
                         if gate and gate.action:
                             action = gate.action
-                            require(action["type"] == "patch", "unexpected Codex fixture action")
                             candidates = []
                             for t in body.get("tools", []):
                                 candidates.extend((x, t.get("name")) for x in t.get("tools", [])) if t.get("type") == "namespace" else candidates.append((t, None))
-                            tool, namespace = next((t, n) for t, n in candidates if t.get("name") == "apply_patch")
-                            require(tool.get("type") == "custom", "native apply_patch custom tool missing")
-                            item = {"type": "custom_tool_call", "id": "fc-" + ident, "call_id": action["id"],
-                                    "name": "apply_patch", "input": action["patch"]}
+                            if action["type"] == "shell":
+                                tool, namespace = next((t, n) for t, n in candidates if t.get("name") in ("shell_command", "exec_command"))
+                                args = ({"command": action["command"], "timeout_ms": 10000} if tool["name"] == "shell_command"
+                                        else {"cmd": action["command"], "max_output_tokens": 200})
+                                item = {"type": "function_call", "id": "fc-" + ident, "call_id": action["id"],
+                                        "name": tool["name"], "arguments": json.dumps(args)}
+                            else:
+                                require(action["type"] == "patch", "unexpected Codex fixture action")
+                                tool, namespace = next((t, n) for t, n in candidates if t.get("name") == "apply_patch")
+                                require(tool.get("type") == "custom", "native apply_patch custom tool missing")
+                                item = {"type": "custom_tool_call", "id": "fc-" + ident, "call_id": action["id"],
+                                        "name": "apply_patch", "input": action["patch"]}
                             if namespace:
                                 item["namespace"] = namespace
                         streaming = []
@@ -445,6 +452,7 @@ cp.spawn=function(...args) {
                    CODEX_HOME=str(home / ".codex"), CLAUDE_CONFIG_DIR=str(home / ".claude"), CLAUDE_SECURESTORAGE_CONFIG_DIR=str(home / ".claude"),
                    CODEG_HOME=str(data), CODEG_DATA_DIR=str(data), CODEG_STATIC_DIR=str(self.root / "static"), CODEG_TOKEN=self.token,
                    CODEG_HOST="127.0.0.1", CODEG_ACP_DEBUG="1", CODEG_ACP_HOST_TOOLS="agent",
+                   CODEG_LOG="info,codeg_lib::acp::workspace_history=debug",
                    CODEX_PATH=str(native), MODEL_PROVIDER="mock", NO_BROWSER="1", ANTHROPIC_API_KEY="native-e2e-dummy-key",
                    ANTHROPIC_BASE_URL=self.model.base, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1", CLAUDE_CODE_DISABLE_BACKGROUND_TASKS="1",
                    CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION="false", NODE_OPTIONS="--require=" + json.dumps(str(observer)),
@@ -958,6 +966,161 @@ cp.spawn=function(...args) {
             self.check(agent + ".files_hardlink_skipped_regular_restored", preview=linked_preview, apply=skipped, hashes=snapshot(), linkedFileSha256=sha(link))
         self.call("acp_disconnect", {"connectionId": conn})
 
+    def workspace_checkpoint_scenario(self, agent):
+        """Real shell writes in a non-Git workspace; only owned fixture data changes."""
+        work = self.work / (agent + "-workspace-checkpoints")
+        work.mkdir()
+        (work / "changed.txt").write_bytes(b"ORIGINAL\n")
+        (work / "deleted.txt").write_bytes(b"RESTORE_DELETED\n")
+        (work / "unrelated.txt").write_bytes(b"KEEP\n")
+        require(not (work / ".git").exists(), "fixture must not be a Git checkout")
+        conn, sid = self.connect(agent, work=work, mode="agent-full-access" if agent == "codex" else "bypassPermissions")
+        caps = self.call("acp_native_capabilities", {"connectionId": conn})
+        require("workspaceRewindFiles" in json.dumps(caps), "host checkpoint capability absent")
+
+        def snapshot():
+            return {p.name: p.read_bytes().hex() for p in work.iterdir() if p.is_file()}
+
+        def mutate(marker, script):
+            offset = len(self.events)
+            call_id = "checkpoint_shell_" + uuid.uuid4().hex[:12]
+            if agent == "codex":
+                action = {"type": "shell", "id": call_id, "command": script}
+            else:
+                # Claude's Bash launches PowerShell explicitly on Windows.
+                import base64
+                encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+                powershell = Path(os.environ.get("SYSTEMROOT", "C:/Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+                command = '"' + powershell.as_posix() + '" -NoProfile -NonInteractive -EncodedCommand ' + encoded
+                action = {"name": "Bash", "id": call_id, "input": {"command": command, "timeout": 10000}}
+            self.model.arm(marker, action=action)
+            final = self.model.arm(marker)
+            self.prompt(conn, marker)
+            self.wait(final.seen.is_set, "shell completed " + marker)
+            self.wait(lambda: any(e.get("type") == "turn_complete" for e in self.conn_events(conn, offset)), "checkpoint completion " + marker)
+            self.idle(conn)
+            detail = self.history(agent, sid)
+            target = next(t for t in detail["turns"] if t["role"] == "user" and marker == text_of(t["blocks"]))
+            return target, detail
+
+        def control(target, dry=True, **extras):
+            return unwrap(self.native(conn, "workspace_rewind_files", {**self.expected(target), "dryRun": dry, **extras}))
+
+        def reject(target, **extras):
+            self.native(conn, "workspace_rewind_files", {**self.expected(target), "dryRun": True, **extras}, refuse=True)
+
+        keep, kept_history = mutate("CHECKPOINT_KEEP", "[IO.File]::WriteAllText((Join-Path (Get-Location) 'keep.txt'), 'KEEP_FIRST')")
+        require((work / "keep.txt").read_bytes() == b"KEEP_FIRST", "first native shell did not write")
+        first_preview = control(keep)
+        require(first_preview.get("canRevert") is True and first_preview["paths"] == ["keep.txt"], first_preview)
+        self.check(agent + ".workspace_first_prompt_captured")
+        baseline = snapshot()
+        target, _ = mutate("CHECKPOINT_REMOVE", "[IO.File]::WriteAllText((Join-Path (Get-Location) 'new.txt'), 'NEW_SECOND'); [IO.File]::WriteAllText((Join-Path (Get-Location) 'changed.txt'), 'CHANGED_SECOND'); [IO.File]::Delete((Join-Path (Get-Location) 'deleted.txt'))")
+        _, original_history = mutate("CHECKPOINT_LATER", "[IO.File]::WriteAllText((Join-Path (Get-Location) 'new.txt'), 'NEW_THIRD'); [IO.File]::WriteAllText((Join-Path (Get-Location) 'changed.txt'), 'CHANGED_THIRD')")
+        require((work / "new.txt").read_bytes() == b"NEW_THIRD" and (work / "changed.txt").read_bytes() == b"CHANGED_THIRD" and not (work / "deleted.txt").exists(), "shell create/edit/delete did not execute")
+        changed = snapshot()
+        count = len(self.model.requests)
+        preview = control(target)
+        require(preview.get("canRevert") is True and set(preview["paths"]) == {"new.txt", "changed.txt", "deleted.txt"}, preview)
+        require(snapshot() == changed, "preview mutated workspace")
+        self.check(agent + ".workspace_shell_span_preview_nonmutating", paths=preview["paths"])
+
+        # A stale preview may never overwrite a later manual edit.
+        (work / "changed.txt").write_bytes(b"MANUAL_CONFLICT")
+        conflict = snapshot()
+        reject(target, dryRun=False, previewToken=preview["previewToken"])
+        reject(target)
+        require(snapshot() == conflict and self.authored(self.history(agent, sid)) == self.authored(original_history), "conflict refusal mutated files/history")
+        self.check(agent + ".workspace_stale_preview_conflict_nonmutating")
+        (work / "changed.txt").write_bytes(b"CHANGED_THIRD")
+
+        # Missing historical coverage is refused rather than inferred from current files.
+        records = list((self.root / "data/workspace-checkpoints").glob("*/history/*.json"))
+        require(records, "no persisted host checkpoint records")
+        record = next((p for p in records if len((r := json.loads(p.read_text()))["before_prefix"]) > 0
+                       and r["checkpoint"]["before"]["root"].endswith(work.name)), None)
+        require(record, "missing subsequent-turn checkpoint")
+        saved = record.with_suffix(".fixture-backup")
+        record.rename(saved)
+        try:
+            reject(target)
+            require(snapshot() == changed, "missing coverage mutated files")
+        finally:
+            saved.rename(record)
+        self.check(agent + ".workspace_missing_coverage_refused")
+
+        # Close and re-open the native session: snapshots must survive host connections.
+        self.call("acp_disconnect", {"connectionId": conn})
+        conn, resumed = self.connect(agent, sid, work=work, mode="agent-full-access" if agent == "codex" else "bypassPermissions")
+        require(resumed == sid, "cold checkpoint resume forked session")
+        preview = control(target)
+        # A new unrelated file created outside the recorded turns must survive.
+        (work / "outside-span.txt").write_bytes(b"MANUAL_KEEP")
+        result = control(target, False, previewToken=preview["previewToken"])
+        require(result.get("reverted") is True, result)
+        require(snapshot() == {**baseline, "outside-span.txt": b"MANUAL_KEEP".hex()}, "restore did not recover exact pre-turn bytes")
+        require(self.authored(self.history(agent, sid)) == self.authored(original_history), "file restore rewound history implicitly")
+        reject(target, dryRun=False, previewToken=preview["previewToken"])
+        self.call("acp_prompt", {"connectionId": conn, "blocks": [{"type": "text", "text": "MUST_NOT_START_DURING_RESTORE"}], **self.links[conn]}, refuse=True)
+        self.native(conn, "rewind", self.expected(keep), refuse=True)
+        require(len(self.model.requests) == count, "pending file restore admitted new generation")
+        self.check(agent + ".workspace_pending_restore_blocks_new_work_and_wrong_rewind")
+        self.call("acp_disconnect", {"connectionId": conn})
+        (work / "changed.txt").write_bytes(b"EXTERNAL_AFTER_RESTORE")
+        conn, resumed = self.connect(agent, sid, work=work, mode="agent-full-access" if agent == "codex" else "bypassPermissions")
+        require(resumed == sid, "file recovery reconnect forked")
+        self.native(conn, "rewind", self.expected(target), refuse=True)
+        require((work / "changed.txt").read_bytes() == b"EXTERNAL_AFTER_RESTORE"
+                and self.authored(self.history(agent, sid)) == self.authored(original_history), "recovery conflict changed files/history")
+        self.check(agent + ".workspace_reconnect_revalidates_restored_files")
+        # Restore only the fixture's known original bytes, then complete its paired history step.
+        (work / "changed.txt").write_bytes(bytes.fromhex(baseline["changed.txt"]))
+        ack = unwrap(self.native(conn, "rewind", self.expected(target)))
+        require(ack.get("rewound") is True, ack)
+        self.wait(lambda: self.authored(self.history(agent, sid)) == self.authored(kept_history), "native history persisted rewind")
+        require(self.snap(conn)["external_id"] == sid, "combined restore forked session")
+        self.no_generation(count)
+        self.check(agent + ".workspace_cold_restore_files_then_history_same_id", sessionId=sid, restored=sorted(result["paths"]), files=snapshot())
+
+        # A manual edit between captured turns breaks ownership of the full span.
+        gap_target, _ = mutate("CHECKPOINT_GAP_FIRST", "[IO.File]::WriteAllText((Join-Path (Get-Location) 'gap.txt'), 'FIRST')")
+        (work / "gap-manual.txt").write_bytes(b"INTERTURN_MANUAL")
+        mutate("CHECKPOINT_GAP_SECOND", "[IO.File]::WriteAllText((Join-Path (Get-Location) 'gap.txt'), 'SECOND')")
+        before_gap = snapshot()
+        reject(gap_target)
+        require(snapshot() == before_gap, "inter-turn gap refusal changed files")
+        self.check(agent + ".workspace_interturn_manual_gap_refused")
+        self.call("acp_disconnect", {"connectionId": conn})
+
+    def workspace_overlap_scenario(self):
+        """A second host writer in a nested workspace invalidates both captures."""
+        work = self.work / "overlap-parent"
+        child = work / "child"
+        child.mkdir(parents=True)
+        a, sid_a = self.connect("codex", work=work)
+        b, sid_b = self.connect("claude_code", work=child)
+        marker_a, marker_b = "OVERLAP_PARENT_ACTIVE", "OVERLAP_CHILD_ACTIVE"
+        offset = len(self.events)
+        held = self.model.arm(marker_a, hold=True)
+        self.prompt(a, marker_a)
+        self.wait(held.seen.is_set, "parent model held")
+        self.send(b, marker_b)
+        held.release.set()
+        self.wait(lambda: any(e.get("type") == "turn_complete" for e in self.conn_events(a, offset)), "overlapping parent completion")
+        self.idle(a)
+        for conn, sid, agent, marker in ((a, sid_a, "codex", marker_a), (b, sid_b, "claude_code", marker_b)):
+            turn = next(t for t in self.history(agent, sid)["turns"] if t["role"] == "user" and text_of(t["blocks"]) == marker)
+            self.native(conn, "workspace_rewind_files", {**self.expected(turn), "dryRun": True}, refuse=True)
+        self.check("workspace.overlapping_parent_child_cross_agent_captures_refused")
+        # Isolation protects snapshots without disabling ordinary multi-agent work.
+        self.send(a, "AFTER_OVERLAP_QUIET")
+        target = next(t for t in self.history("codex", sid_a)["turns"] if t["role"] == "user" and text_of(t["blocks"]) == "AFTER_OVERLAP_QUIET")
+        preview = unwrap(self.native(a, "workspace_rewind_files", {**self.expected(target), "dryRun": True}))
+        require(preview.get("canRevert") is True and preview.get("paths") == [], preview)
+        self.check("workspace.quiet_turn_after_overlap_captures_normally")
+        for conn in (a, b):
+            self.call("acp_disconnect", {"connectionId": conn})
+
     def plain_history_scenario(self):
         """Independent baseline exposes later stages even when whitespace fails."""
         conn, sid = self.connect("codex")
@@ -1082,7 +1245,10 @@ cp.spawn=function(...args) {
                          "codex-plain": self.plain_history_scenario,
                          "claude": lambda: self.rewind_scenario("claude_code"), "queue": self.queue_scenario,
                          "files-codex": lambda: self.file_restore_scenario("codex"),
-                         "files-claude": lambda: self.file_restore_scenario("claude_code")}
+                         "files-claude": lambda: self.file_restore_scenario("claude_code"),
+                         "workspace-codex": lambda: self.workspace_checkpoint_scenario("codex"),
+                         "workspace-claude": lambda: self.workspace_checkpoint_scenario("claude_code"),
+                         "workspace-overlap": self.workspace_overlap_scenario}
             selected = self.args.scenarios.split(",")
             for name in scenarios:
                 if name not in selected:
@@ -1116,7 +1282,7 @@ cp.spawn=function(...args) {
                             self.untested(remaining, "fixture failed or had an unconsumed gate; rerun independently with fresh provider")
                         break
             self.untested("desktop_composer_UI", "HTTP validates no auto-send and explicit send semantics; no browser/desktop interaction in this script")
-            if not any(name.startswith("files-") for name in selected):
+            if not any(name.startswith(("files-", "workspace-")) for name in selected):
                 self.untested("file_restore", "not selected in this run")
             require(not self.model.errors, self.model.errors)
             self.report["success"] = not self.report["failures"]
@@ -1139,7 +1305,7 @@ def main():
     parser.add_argument("--codex-native", help="Installed native Codex executable")
     parser.add_argument("--sidecar-dir", help="Directory containing real release codeg-mcp.exe and codeg-computer-helper.exe")
     parser.add_argument("--timeout", type=float, default=60)
-    parser.add_argument("--scenarios", default="codex-live,codex-plain,claude,queue", help="Comma-separated codex-live,codex-replay,codex-plain,claude,queue,files-codex,files-claude")
+    parser.add_argument("--scenarios", default="codex-live,codex-plain,claude,queue", help="Comma-separated codex-live,codex-replay,codex-plain,claude,queue,files-codex,files-claude,workspace-codex,workspace-claude,workspace-overlap")
     args = parser.parse_args()
     return Audit(args).run()
 

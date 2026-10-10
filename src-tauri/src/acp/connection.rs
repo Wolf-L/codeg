@@ -1180,6 +1180,9 @@ pub enum ConnectionCommand {
     },
     Prompt {
         blocks: Vec<PromptInputBlock>,
+        /// Registered before enqueue; ownership survives removal from the
+        /// connection map until this command is discarded or actually settles.
+        workspace_writer: crate::acp::workspace_history::HostWriter,
         /// Pre-projected cross-client user-message broadcast (`message_id` +
         /// user blocks), computed by the manager under the prompt lock. The
         /// loop emits it as `AcpEvent::UserMessage` right before issuing the
@@ -6678,6 +6681,7 @@ async fn run_connection(
                 // agents could ship it someday).
                 s.native_steering_available = native_steering_available;
                 s.native_capabilities = crate::acp::native_session::capabilities(init_resp.meta.as_ref());
+                crate::acp::workspace_history::advertise(&mut s.native_capabilities, agent_type);
                 s.native_protected_mcp = mcp_servers.iter().skip(configured_mcp_count).cloned().collect();
                 s.codex_user_input_shape = codex_user_input_shape;
                 s.neutral_goal_channel = neutral_goal_channel;
@@ -7351,7 +7355,7 @@ async fn run_connection(
                 .await;
                 emit_selectors_ready(&state, &emitter_clone).await;
 
-                let loop_result = run_conversation_loop(
+                let loop_result = run_new_conversation_loop(
                     &mut session,
                     &conn_id,
                     &emitter_clone,
@@ -11000,6 +11004,33 @@ async fn run_conversation_loop(
     // read at turn end to explain a silent `EndTurn`.
     stderr_tail: &Arc<StderrTail>,
 ) -> Result<Option<ForkExitInfo>, agent_client_protocol::Error> {
+    run_conversation_loop_inner(session, conn_id, emitter, state, agent_type, perms,
+        cmd_rx, terminal_runtime, cwd, supports_fork, prompt_ledger, delegation_injection,
+        stderr_tail, false).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_new_conversation_loop(
+    session: &mut AgentSession, conn_id: &str, emitter: &EventEmitter,
+    state: &Arc<RwLock<SessionState>>, agent_type: AgentType, perms: &PendingPermissions,
+    cmd_rx: &mut mpsc::Receiver<ConnectionCommand>, terminal_runtime: Arc<TerminalRuntime>,
+    cwd: &str, supports_fork: bool, prompt_ledger: &background_watch::PromptLedger,
+    delegation_injection: Option<&DelegationInjection>, stderr_tail: &Arc<StderrTail>,
+) -> Result<Option<ForkExitInfo>, agent_client_protocol::Error> {
+    run_conversation_loop_inner(session, conn_id, emitter, state, agent_type, perms,
+        cmd_rx, terminal_runtime, cwd, supports_fork, prompt_ledger, delegation_injection,
+        stderr_tail, true).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_conversation_loop_inner(
+    session: &mut AgentSession, conn_id: &str, emitter: &EventEmitter,
+    state: &Arc<RwLock<SessionState>>, agent_type: AgentType, perms: &PendingPermissions,
+    cmd_rx: &mut mpsc::Receiver<ConnectionCommand>, terminal_runtime: Arc<TerminalRuntime>,
+    cwd: &str, supports_fork: bool, prompt_ledger: &background_watch::PromptLedger,
+    delegation_injection: Option<&DelegationInjection>, stderr_tail: &Arc<StderrTail>,
+    mut confirmed_new: bool,
+) -> Result<Option<ForkExitInfo>, agent_client_protocol::Error> {
     // Session-scoped cache for diffing cumulative `raw_output` snapshots
     // into incremental deltas. Shared across the idle loop and the active
     // turn loop so tool calls that span turns stay consistent.
@@ -11154,7 +11185,9 @@ async fn run_conversation_loop(
             Some(ConnectionCommand::Prompt {
                 blocks,
                 user_message,
+                workspace_writer,
             }) => {
+                let mut workspace_writer = Some(workspace_writer);
                 state.write().await.native_superseded_host_turn = false;
                 // Fingerprint the outgoing prompt for the background watcher's
                 // foreground/out-of-turn classifier BEFORE the blocks are
@@ -11287,6 +11320,9 @@ async fn run_conversation_loop(
                 // order matches the wire order even if the agent replies
                 // instantly — and awaited, so the replay gate can never see
                 // this conversation as transcript-less (see `record_prompt`).
+                // Native persisted identities and shell writes both participate:
+                // capture before dispatch, outside the UI/state locks.
+                let mut workspace_checkpoint = crate::acp::workspace_history::begin(state, &prompt_blocks, std::mem::take(&mut confirmed_new), workspace_writer.as_ref().expect("host writer is scoped to the prompt")).await;
                 record_prompt(agent_type, &sid.0, &prompt_blocks).await;
                 let turn_started_at_ms = crate::acp_transcript::now_epoch_ms();
                 let prompt_request = PromptRequest::new(sid.clone(), prompt_blocks);
@@ -11297,6 +11333,12 @@ async fn run_conversation_loop(
                 // out of "this turn" and demote the most relevant evidence to a
                 // stale-looking `recent` fallback.
                 let stderr_mark = stderr_tail.mark();
+                // Once dispatch can start, a transport failure, disconnected
+                // loop, or aborted task does not prove native tools stopped.
+                // Keep the workspace fenced until the actual prompt response.
+                if let Some(writer) = workspace_writer.as_mut() {
+                    writer.retain_until_confirmed();
+                }
                 // Use Box::pin (heap) instead of tokio::pin! (stack) so the
                 // future can be moved into a background task on cancel.
                 let mut prompt_response = Box::pin(
@@ -11451,6 +11493,11 @@ async fn run_conversation_loop(
                             // the empty-turn diagnosis for a prompt the
                             // agent really did answer with nothing.
                             if let Some(delta) = air_async_task_delta(&dispatch) {
+                                // Conservatively reject prompts that launched
+                                // detached work, even if a later tick settles it.
+                                if delta.spawned {
+                                    workspace_checkpoint = None;
+                                }
                                 probe.saw_agent_output |= delta.spawned;
                                 emit_with_state(
                                     &st,
@@ -11686,6 +11733,9 @@ async fn run_conversation_loop(
                                 }
                                 Err(e) => return Err(e),
                             };
+                            if let Some(writer) = workspace_writer.as_mut() {
+                                writer.confirm_finished();
+                            }
                             // Grok names the prompt on its response as well:
                             // the id this turn's late frames will carry.
                             if agent_type == AgentType::Grok {
@@ -11757,6 +11807,9 @@ async fn run_conversation_loop(
                             // may be unpersisted (see journal_turn_span).
                             if reason_str == "end_turn" {
                                 journal_turn_span(&mut turn_timing_probe, conn_id, &sid.0).await;
+                                if terminal_failure.is_none() && tracked_terminal_tool_calls.is_empty() {
+                                    crate::acp::workspace_history::finish(state, workspace_checkpoint.take()).await;
+                                }
                             }
                             // ACP has no turn-end notification — the stop
                             // reason arrives here, in the prompt RESPONSE — so
@@ -11966,6 +12019,10 @@ async fn run_conversation_loop(
                                     }
                                 }
                                 Some(ConnectionCommand::Steer { blocks, reply }) => {
+                                    crate::acp::workspace_history::invalidate_overlapping(state).await;
+                                    // A steer is another native user boundary, not
+                                    // a completed host prompt checkpoint.
+                                    workspace_checkpoint = None;
                                     // Protocol round-trip only — the manager's
                                     // cancellation-shielded task records the
                                     // note + broadcasts `FeedbackSubmitted`
@@ -12026,6 +12083,10 @@ async fn run_conversation_loop(
                                     let _ = reply.send(outcome);
                                 }
                                 Some(ConnectionCommand::NativeOperation { operation, params, reply }) => {
+                                    if operation.is_mutation(&params) {
+                                        crate::acp::workspace_history::invalidate_overlapping(state).await;
+                                        workspace_checkpoint = None;
+                                    }
                                     dispatch_native_operation(&cx, &sid, state, operation, params, reply);
                                 }
                                 Some(ConnectionCommand::StopAsyncTask {
@@ -12043,6 +12104,7 @@ async fn run_conversation_loop(
                                     );
                                 }
                                 Some(ConnectionCommand::Cancel) => {
+                                    drop(workspace_checkpoint.take());
                                     // Send CancelNotification to agent to stop the current turn
                                     let _ = cx.send_notification_to(
                                         Agent,
@@ -12136,8 +12198,18 @@ async fn run_conversation_loop(
                                     // `$/cancel_request` on top of the
                                     // `session/cancel` above — a second
                                     // cancellation of the same turn.
+                                    let mut detached_writer = workspace_writer.take();
+                                    if let Some(writer) = detached_writer.as_mut() {
+                                        writer.retain_until_confirmed();
+                                    }
                                     tokio::spawn(async move {
-                                        let _ = prompt_response.await;
+                                        if prompt_response.await.is_ok() {
+                                            if let Some(writer) = detached_writer.as_mut() {
+                                                writer.confirm_finished();
+                                            }
+                                        }
+                                        // Error/aborted drain retains the registry fence.
+                                        drop(detached_writer);
                                     });
                                     break;
                                 }
@@ -16383,12 +16455,17 @@ fn is_known_ext_method(method: &str) -> bool {
 }
 
 fn observe_native_history(state: &Arc<RwLock<SessionState>>, dispatch: &Dispatch) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let detached = air_async_task_delta(dispatch).is_some()
+        || matches!(dispatch, Dispatch::Notification(message) if message.method().starts_with("_session/queue/"));
     let params = match dispatch {
         Dispatch::Notification(message) if message.method() == "session/update" => Some(message.params().clone()),
         _ => None,
     };
     let state = Arc::clone(state);
     async move {
+        if detached || !state.read().await.turn_in_flight {
+            crate::acp::workspace_history::invalidate_overlapping(&state).await;
+        }
         let Some(params) = params else { return; };
         let mut s = state.write().await;
         if s.agent_type != AgentType::Codex { return; }
@@ -31774,6 +31851,7 @@ mod tests {
                 .send(ConnectionCommand::Prompt {
                     blocks: vec![PromptInputBlock::Text { text: text.into() }],
                     user_message: None,
+                    workspace_writer: crate::acp::workspace_history::host_writer(&self.state).await,
                 })
                 .await
                 .expect("the loop is running");
@@ -32936,6 +33014,7 @@ mod tests {
                 .send(ConnectionCommand::Prompt {
                     blocks: vec![PromptInputBlock::Text { text: text.into() }],
                     user_message: None,
+                    workspace_writer: crate::acp::workspace_history::host_writer(&self.state).await,
                 })
                 .await
                 .expect("the loop is running");
@@ -33294,6 +33373,7 @@ mod tests {
                         text: "go on".into(),
                     }],
                     user_message: None,
+                    workspace_writer: crate::acp::workspace_history::host_writer(&self.state).await,
                 })
                 .await
                 .expect("the loop is running");

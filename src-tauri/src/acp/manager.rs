@@ -1019,6 +1019,9 @@ impl ConnectionManager {
             .reserve()
             .await
             .map_err(|_| AcpError::ProcessExited)?;
+        let _workspace_guard = crate::acp::workspace_history::lock_workspace(&state_arc).await?;
+        crate::acp::workspace_history::ensure_no_transaction(&state_arc).await?;
+        let workspace_writer = crate::acp::workspace_history::host_writer(&state_arc).await;
         {
             let mut s = state_arc.write().await;
             if s.native_recovery_required || s.native_mutation_in_flight {
@@ -1046,6 +1049,7 @@ impl ConnectionManager {
         permit.send(ConnectionCommand::Prompt {
             blocks,
             user_message,
+            workspace_writer,
         });
         Ok(())
     }
@@ -1767,29 +1771,37 @@ impl ConnectionManager {
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
             (conn.cmd_tx.clone(), conn.agent_type, conn.state.clone())
         };
+        let permit = cmd_tx.reserve().await.map_err(|_| AcpError::ProcessExited)?;
+        let workspace_guard = crate::acp::workspace_history::lock_workspace(&state_arc).await?;
+        crate::acp::workspace_history::ensure_no_transaction(&state_arc).await?;
+        crate::acp::workspace_history::invalidate_overlapping(&state_arc).await;
         // Read the goal state as it was when the user clicked — reading it after
         // the round-trip would see the transition we just asked for.
         let interrupts = crate::acp::registry::goal_control_is_out_of_band(agent_type)
             && state_arc.read().await.goal_active;
-        // Only ask for an answer when it would change what we do next.
-        let (reply_tx, reply_rx) = if interrupts {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-        cmd_tx
-            .send(ConnectionCommand::GoalControl {
-                action,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| AcpError::ProcessExited)?;
-
-        let Some(reply_rx) = reply_rx else {
+        // Even a non-interrupting control needs a completion acknowledgement:
+        // an in-band adapter can start work while the host still looks idle.
+        let mut writer = crate::acp::workspace_history::host_writer(&state_arc).await;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        writer.retain_until_confirmed();
+        permit.send(ConnectionCommand::GoalControl {
+            action,
+            reply: Some(reply_tx),
+        });
+        drop(workspace_guard);
+        let drain = tokio::spawn(async move {
+            let landed = matches!(reply_rx.await, Ok(true));
+            if landed {
+                writer.confirm_finished();
+            }
+            // A failed RPC may have reached the agent. Keep unknown writers
+            // fenced, including when the caller disappears before the reply.
+            landed
+        });
+        if !interrupts {
             return Ok(());
-        };
-        if !matches!(reply_rx.await, Ok(true)) {
+        }
+        if !matches!(drain.await, Ok(true)) {
             return Ok(());
         }
         tracing::info!(
@@ -1835,6 +1847,50 @@ impl ConnectionManager {
             }
             (s.agent_type, s.external_id.clone().ok_or_else(|| AcpError::protocol("Session is not ready"))?)
         };
+        // Channel backpressure must never hold process-wide admission. An
+        // owned permit can be transferred to the cancellation-shielded task.
+        let permit = if operation == NativeOperation::WorkspaceRewindFiles {
+            None
+        } else {
+            Some(cmd_tx.reserve_owned().await.map_err(|_| AcpError::ProcessExited)?)
+        };
+        let mutation = operation.is_mutation(&params);
+        let workspace_guard = if mutation || operation == NativeOperation::WorkspaceRewindFiles {
+            crate::acp::workspace_history::lock_workspace(&state).await?
+        } else {
+            None
+        };
+        if matches!(operation, NativeOperation::WorkspaceRewindFiles | NativeOperation::Rewind) {
+            crate::acp::workspace_history::ensure_no_writers(&state).await?;
+            // Snapshot handles under the map lock; never hold it across parsing
+            // or filesystem work. Admission uses the same workspace mutex.
+            let peers: Vec<_> = self.connections.lock().await.values().map(|c| c.state.clone()).collect();
+            let root = state.read().await.working_dir.clone().and_then(|p| p.canonicalize().ok());
+            for peer in peers {
+                let peer = peer.read().await;
+                if root.as_ref().zip(peer.working_dir.as_ref().and_then(|p| p.canonicalize().ok()).as_ref()).is_some_and(|(a,b)| crate::acp::workspace_history::overlaps(a,b))
+                    && !crate::acp::workspace_history::idle(&peer) {
+                    return Err(AcpError::protocol("Workspace is in use by another connection, queue or background task"));
+                }
+            }
+        }
+        if operation == NativeOperation::Rewind {
+            if let Some(result) = crate::acp::workspace_history::guard_history_rewind(&state, &params).await? {
+                return Ok(result);
+            }
+        } else if mutation || operation == NativeOperation::WorkspaceRewindFiles {
+            crate::acp::workspace_history::ensure_no_transaction(&state).await?;
+        }
+        if operation == NativeOperation::WorkspaceRewindFiles {
+            // Host snapshots are never sent to the adapter. The task retains
+            // the prompt lock and mutation fence if its HTTP caller goes away.
+            let task = tokio::spawn(async move {
+                let _guard = guard;
+                let _workspace_guard = workspace_guard;
+                crate::acp::workspace_history::rewind(state, params).await
+            });
+            return task.await.map_err(|_| AcpError::protocol("Workspace restore task failed; inspect workspace before retrying"))?;
+        }
         if matches!(operation, NativeOperation::Rewind | NativeOperation::RewindFiles) {
             let object = params.as_object_mut().ok_or_else(|| AcpError::protocol("Invalid parameters"))?;
             let allowed = if operation == NativeOperation::Rewind { vec!["turnId", "expectedTurn"] } else { vec!["turnId", "expectedTurn", "dryRun"] };
@@ -1902,10 +1958,25 @@ impl ConnectionManager {
         // The connection-scoped task owns the actual RPC and never replays it.
         let task = tokio::spawn(async move {
             let _guard = guard;
+            let mut writer = if mutation {
+                let mut writer = crate::acp::workspace_history::host_writer(&state).await;
+                writer.retain_until_confirmed();
+                Some(writer)
+            } else { None };
             let (reply, receiver) = tokio::sync::oneshot::channel();
-            cmd_tx.send(ConnectionCommand::NativeOperation { operation, params, reply }).await
-                .map_err(|_| AcpError::ProcessExited)?;
-            receiver.await.map_err(|_| AcpError::ProcessExited)?
+            permit.expect("native RPC reserved capacity").send(ConnectionCommand::NativeOperation { operation, params, reply });
+            drop(workspace_guard);
+            let response = receiver.await.map_err(|_| AcpError::ProcessExited)?;
+            // Dispatch marks unknown transport/RPC outcomes before replying.
+            // Local validation refusals have no pending writer to retain.
+            if !state.read().await.native_recovery_required {
+                if let Some(writer) = writer.as_mut() { writer.confirm_finished(); }
+            }
+            let result = response?;
+            if operation == NativeOperation::Rewind && result.get("rewound").and_then(serde_json::Value::as_bool) == Some(true) {
+                crate::acp::workspace_history::acknowledge_history_rewind(&state).await?;
+            }
+            Ok(result)
         });
         task.await.map_err(|error| AcpError::protocol(error.to_string()))?
     }
@@ -2178,6 +2249,20 @@ impl ConnectionManager {
             return Err(AcpError::TurnInProgress);
         }
 
+        let permit = cmd_tx.reserve_owned().await.map_err(|_| AcpError::ProcessExited)?;
+        let workspace_guard = crate::acp::workspace_history::lock_workspace(&state_arc).await?;
+        crate::acp::workspace_history::ensure_no_transaction(&state_arc).await?;
+        {
+            let s = state_arc.read().await;
+            if s.native_recovery_required || s.native_mutation_in_flight || s.native_queue_turn_id.is_some() || s.native_queue_pending {
+                return Err(AcpError::protocol("Reconcile native operations and queue before forking"));
+            }
+            if s.turn_in_flight {
+                return Err(AcpError::TurnInProgress);
+            }
+        }
+        let mut writer = crate::acp::workspace_history::host_writer(&state_arc).await;
+
         // CANCELLATION SHIELD. Up to here the fork is side-effect-free: if THIS
         // future is dropped now (e.g. an HTTP client disconnecting mid-fork), the
         // `prompt_guard` drops and nothing happened. But the instant we enqueue
@@ -2202,16 +2287,16 @@ impl ConnectionManager {
             let outcome: Result<ForkResultInfo, AcpError> = async {
                 // Protocol-only round trip — no DB writes inside the loop.
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                cmd_tx
-                    .send(ConnectionCommand::Fork {
-                        fork_point,
-                        reply: reply_tx,
-                    })
-                    .await
-                    .map_err(|_| AcpError::ProcessExited)?;
+                writer.retain_until_confirmed();
+                permit.send(ConnectionCommand::Fork {
+                    fork_point,
+                    reply: reply_tx,
+                });
+                drop(workspace_guard);
                 let protocol_result = reply_rx
                     .await
                     .map_err(|_| AcpError::protocol("Fork reply channel closed".to_string()))??;
+                writer.confirm_finished();
 
                 let forked_session_id = protocol_result.forked_session_id;
                 let original_session_id = protocol_result.original_session_id;
@@ -3198,6 +3283,9 @@ impl ConnectionManager {
                 .await;
         }
 
+        let _workspace_guard = crate::acp::workspace_history::lock_workspace(&state).await?;
+        crate::acp::workspace_history::ensure_no_transaction(&state).await?;
+
         // The pull tool delivers plain text (`PendingFeedback`), so a draft
         // carrying attachment blocks cannot ride it without silently dropping
         // them. Two ways to get here: an ordinary pull session (the composer
@@ -3301,7 +3389,7 @@ impl ConnectionManager {
                     &crate::paths::codeg_uploads_root(),
                 )
                 .await?;
-                // Hydration is the ONLY await this path puts between admission
+                // Hydration can suspend between the initial turn check
                 // and the enqueue, and it runs for as long as reading the
                 // uploads takes. The loop's idle arm already covers "the turn
                 // ended" (it replies `NoActiveTurn`), but it cannot cover "the
@@ -3351,6 +3439,22 @@ impl ConnectionManager {
         let record_blocks = had_blocks
             .then(|| crate::acp::user_blocks_from_prompt(&wire_blocks))
             .filter(|projected| crate::acp::feedback::attachment_bytes(projected) > 0);
+        let permit = cmd_tx.reserve_owned().await.map_err(|_| AcpError::ProcessExited)?;
+        let workspace_guard = crate::acp::workspace_history::lock_workspace(&state).await?;
+        crate::acp::workspace_history::ensure_no_transaction(&state).await?;
+        {
+            let s = state.read().await;
+            if s.native_recovery_required || s.native_mutation_in_flight {
+                return Err(AcpError::protocol("Native operation is pending or requires reconnection"));
+            }
+            // Backpressure/admission may outlast the turn just as hydration
+            // can. Never steer a newer turn after waiting for queue capacity.
+            if steered_turn_changed(admitted_turns_completed,
+                s.turn_in_flight || s.native_queue_turn_id.is_some(), s.turns_completed) {
+                return Err(AcpError::NoActiveTurn);
+            }
+        }
+        let mut writer = crate::acp::workspace_history::host_writer(&state).await;
         let conn_id_for_task = conn_id.to_string();
         let handle = tokio::spawn(async move {
             let outcome: Result<FeedbackItem, AcpError> = async {
@@ -3367,16 +3471,24 @@ impl ConnectionManager {
                 // was created, which is also what the pull path records.
                 let created_at = chrono::Utc::now();
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                cmd_tx
-                    .send(ConnectionCommand::Steer {
-                        blocks: wire_blocks,
-                        reply: reply_tx,
-                    })
-                    .await
-                    .map_err(|_| AcpError::ProcessExited)?;
+                writer.retain_until_confirmed();
+                permit.send(ConnectionCommand::Steer {
+                    blocks: wire_blocks,
+                    reply: reply_tx,
+                });
+                drop(workspace_guard);
                 let steer = reply_rx.await.map_err(|_| {
                     AcpError::protocol("Steer reply channel closed".to_string())
-                })??;
+                })?;
+                // A detached new turn or transport failure is not a completed
+                // writer. Injected work remains protected by the active turn;
+                // an explicit idle refusal never started any native work.
+                if matches!(&steer,
+                    Ok(SteerOutcome::Injected | SteerOutcome::PromptRequired)
+                        | Err(AcpError::NoActiveTurn)) {
+                    writer.confirm_finished();
+                }
+                let steer = steer?;
                 match steer {
                     // Honored opt-in: the content was NOT consumed and is
                     // still host-owned. Surface the frontend's existing
@@ -4990,6 +5102,27 @@ mod tests {
         rx
     }
 
+    #[tokio::test]
+    async fn queued_prompt_retains_workspace_fence_after_disconnect() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mgr = ConnectionManager::new();
+        let mut queued = insert_live_connection(&mgr, "queued-writer", AgentType::Codex,
+            Some(workspace.path().to_owned())).await;
+        let _peer_rx = insert_live_connection(&mgr, "restore-peer", AgentType::ClaudeCode,
+            Some(workspace.path().to_owned())).await;
+        mgr.send_prompt("queued-writer", vec![PromptInputBlock::Text { text: "write later".into() }]).await.unwrap();
+        mgr.disconnect("queued-writer").await.unwrap();
+        assert!(mgr.get_state("queued-writer").await.is_none());
+        let peer = mgr.get_state("restore-peer").await.unwrap();
+        assert!(crate::acp::workspace_history::ensure_no_writers(&peer).await.is_err());
+        let pending = queued.try_recv().unwrap();
+        assert!(matches!(&pending, ConnectionCommand::Prompt { .. }));
+        // Taking it off the queue still owns the fence, exactly as the loop does.
+        assert!(crate::acp::workspace_history::ensure_no_writers(&peer).await.is_err());
+        drop(pending); // Discarded before dispatch; no native writer began.
+        assert!(crate::acp::workspace_history::ensure_no_writers(&peer).await.is_ok());
+    }
+
     /// Put a turn in flight on a connection inserted by
     /// [`insert_live_connection`] (which starts them `Connected`).
     async fn mark_prompting(mgr: &ConnectionManager, conn_id: &str) {
@@ -5121,7 +5254,7 @@ mod tests {
         match rx.try_recv() {
             Ok(ConnectionCommand::GoalControl { action, reply }) => {
                 assert_eq!(action, GoalControlAction::Clear);
-                assert!(reply.is_none(), "no interrupt is intended, so none waits");
+                reply.expect("completion drain protects the writer").send(true).unwrap();
             }
             _ => panic!("expected a GoalControl command"),
         }
@@ -5135,7 +5268,7 @@ mod tests {
         // Cancelling would kill the message that carries the clear and leave
         // the goal armed — worse than doing nothing. Same for every adapter
         // whose control channel we haven't verified. No interrupt is intended,
-        // so no reply is even asked for and the call doesn't wait.
+        // so a background drain observes completion without making this call wait.
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
         let mgr = ConnectionManager::new();
@@ -5151,7 +5284,7 @@ mod tests {
         match rx.try_recv() {
             Ok(ConnectionCommand::GoalControl { action, reply }) => {
                 assert_eq!(action, GoalControlAction::Clear);
-                assert!(reply.is_none(), "nobody waits on an in-band control");
+                reply.expect("in-band control still acknowledges its writer").send(true).unwrap();
             }
             _ => panic!("expected a GoalControl command"),
         }
@@ -5166,14 +5299,15 @@ mod tests {
         // the enqueue succeeds and the payload is observable on the command.
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/um-root").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let mgr = ConnectionManager::new();
         let conn_id = "conn-um-root";
         let mut cmd_rx = insert_live_connection(
             &mgr,
             conn_id,
             AgentType::ClaudeCode,
-            Some(PathBuf::from("/tmp/um-root")),
+            Some(workspace.path().to_path_buf()),
         )
         .await;
 
@@ -5191,7 +5325,7 @@ mod tests {
             .await;
         assert!(
             result.is_ok(),
-            "enqueue should succeed with a live receiver"
+            "enqueue should succeed with a live receiver, got {result:?}"
         );
 
         let prompts = drain_prompt_user_messages(&mut cmd_rx);
@@ -5215,14 +5349,15 @@ mod tests {
         use crate::db::test_helpers;
 
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/agent-routes").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let mgr = ConnectionManager::new();
         let conn_id = "conn-agent-routes";
         let mut cmd_rx = insert_live_connection(
             &mgr,
             conn_id,
             AgentType::Codex,
-            Some(PathBuf::from("/tmp/agent-routes")),
+            Some(workspace.path().to_path_buf()),
         )
         .await;
 
@@ -5244,6 +5379,7 @@ mod tests {
         let ConnectionCommand::Prompt {
             blocks,
             user_message,
+            ..
         } = command
         else {
             panic!("expected prompt command");
@@ -5274,14 +5410,15 @@ mod tests {
         use crate::db::test_helpers;
 
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/route-separator").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let mgr = ConnectionManager::new();
         let conn_id = "conn-route-separator";
         let mut cmd_rx = insert_live_connection(
             &mgr,
             conn_id,
             AgentType::Codex,
-            Some(PathBuf::from("/tmp/route-separator")),
+            Some(workspace.path().to_path_buf()),
         )
         .await;
 
@@ -5346,7 +5483,8 @@ mod tests {
         // 49-minute conversation simply vanished from the sidebar.
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/reminted").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let existing = conversation_service::create(
             &db.conn,
             folder_id,
@@ -5373,7 +5511,7 @@ mod tests {
             &mgr,
             conn_id,
             AgentType::Codex,
-            Some(PathBuf::from("/tmp/reminted")),
+            Some(workspace.path().to_path_buf()),
         )
         .await;
         // The connection came up on a session of its own — nobody told it about
@@ -5443,7 +5581,8 @@ mod tests {
         // enqueue a prompt.
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/conflict").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
 
         let holder = conversation_service::create(
             &db.conn,
@@ -5473,7 +5612,7 @@ mod tests {
             &mgr,
             conn_id,
             AgentType::Codex,
-            Some(PathBuf::from("/tmp/conflict")),
+            Some(workspace.path().to_path_buf()),
         )
         .await;
         mgr.get_state(conn_id)
@@ -5545,7 +5684,8 @@ mod tests {
         // would add another.
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/conflict-b").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
 
         let holder =
             conversation_service::create(&db.conn, folder_id, AgentType::Codex, None, None)
@@ -5561,7 +5701,7 @@ mod tests {
             &mgr,
             conn_id,
             AgentType::Codex,
-            Some(PathBuf::from("/tmp/conflict-b")),
+            Some(workspace.path().to_path_buf()),
         )
         .await;
         mgr.get_state(conn_id)
@@ -5610,14 +5750,15 @@ mod tests {
         // re-queue it. Only one Prompt reaches the connection loop.
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/um-gate").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let mgr = ConnectionManager::new();
         let conn_id = "conn-um-gate";
         let mut cmd_rx = insert_live_connection(
             &mgr,
             conn_id,
             AgentType::ClaudeCode,
-            Some(PathBuf::from("/tmp/um-gate")),
+            Some(workspace.path().to_path_buf()),
         )
         .await;
 
@@ -5668,14 +5809,15 @@ mod tests {
         // send), and the connection must stay usable for a real prompt.
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/um-empty").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let mgr = ConnectionManager::new();
         let conn_id = "conn-um-empty";
         let mut cmd_rx = insert_live_connection(
             &mgr,
             conn_id,
             AgentType::ClaudeCode,
-            Some(PathBuf::from("/tmp/um-empty")),
+            Some(workspace.path().to_path_buf()),
         )
         .await;
 
@@ -5883,29 +6025,41 @@ mod tests {
             .insert("c-shield".to_string(), conn);
 
         let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let (enqueued_tx, enqueued_rx) = tokio::sync::oneshot::channel::<()>();
         let fake_loop = tokio::spawn(async move {
-            if let Some(ConnectionCommand::Fork { reply, .. }) = rx.recv().await {
-                go_rx.await.ok(); // withhold the reply until the test releases it
-                let _ = reply.send(Ok(crate::acp::types::ForkProtocolResult {
-                    forked_session_id: "session-S2".into(),
-                    original_session_id: "session-S1".into(),
-                }));
-            }
+            let command = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("timed out waiting for Fork")
+                .expect("fork command channel closed");
+            let ConnectionCommand::Fork { reply, .. } = command else {
+                panic!("expected Fork command");
+            };
+            enqueued_tx.send(()).expect("caller is waiting for Fork");
+            go_rx.await.expect("test releases the withheld reply");
+            let _ = reply.send(Ok(crate::acp::types::ForkProtocolResult {
+                forked_session_id: "session-S2".into(),
+                original_session_id: "session-S1".into(),
+            }));
             rx // keep the receiver alive
         });
 
-        // Drive fork under a short timeout: it spawns the shielded task (which
-        // enqueues `Fork` and blocks on the withheld reply), then the timeout
-        // DROPS this caller future. The detached persistence task must survive.
-        let timed = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            mgr.fork_session(&db, "c-shield", None, None, None),
-        )
-        .await;
-        assert!(
-            timed.is_err(),
-            "caller must be dropped before the withheld reply is delivered"
-        );
+        // Cancel only AFTER the shielded task enqueues Fork. Admission may wait
+        // on the workspace lock, so elapsed time alone cannot establish that
+        // the command crossed the cancellation shield.
+        {
+            let fork = mgr.fork_session(&db, "c-shield", None, None, None);
+            tokio::pin!(fork);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! {
+                    result = &mut fork => {
+                        panic!("fork returned before the withheld reply: {result:?}");
+                    }
+                    result = enqueued_rx => result.expect("fake loop observed Fork"),
+                }
+            })
+            .await
+            .expect("timed out before Fork was enqueued");
+        } // Drop the caller while the reply is still withheld.
 
         // Nothing persisted yet (reply still withheld) — the row is untouched.
         let mid = conversation_service::get_by_id(&db.conn, pre.id)
@@ -5919,8 +6073,11 @@ mod tests {
 
         // Release the reply: the DETACHED task completes the persistence even
         // though the caller is long gone.
-        go_tx.send(()).ok();
-        let _ = fake_loop.await;
+        go_tx.send(()).expect("fake loop is waiting for release");
+        let _rx = tokio::time::timeout(std::time::Duration::from_secs(5), fake_loop)
+            .await
+            .expect("timed out releasing the fork reply")
+            .expect("fake loop completed");
 
         // Poll (bounded) until the two-row layout appears.
         let mut persisted = false;
@@ -5973,6 +6130,7 @@ mod tests {
                     text: "filler".into(),
                 }],
                 user_message: None,
+                workspace_writer: crate::acp::workspace_history::host_writer(&mgr.get_state(conn_id).await.unwrap()).await,
             })
             .await
             .unwrap();
@@ -6009,14 +6167,15 @@ mod tests {
         // own echo by exact id (not a heuristic).
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/um-cmid").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let mgr = ConnectionManager::new();
         let conn_id = "conn-um-cmid";
         let mut cmd_rx = insert_live_connection(
             &mgr,
             conn_id,
             AgentType::ClaudeCode,
-            Some(PathBuf::from("/tmp/um-cmid")),
+            Some(workspace.path().to_path_buf()),
         )
         .await;
 
@@ -6052,7 +6211,8 @@ mod tests {
         // pending_user_message stays None (the loop, which never ran, owns it).
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/um-fail").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let mgr = ConnectionManager::new();
         let conn_id = "conn-um-fail";
         // insert_fake_connection drops the cmd receiver → send_prompt_inner fails.
@@ -6060,7 +6220,7 @@ mod tests {
             &mgr,
             conn_id,
             AgentType::ClaudeCode,
-            Some(PathBuf::from("/tmp/um-fail")),
+            Some(workspace.path().to_path_buf()),
             EventEmitter::Noop,
         )
         .await;
@@ -6100,7 +6260,8 @@ mod tests {
         use crate::acp::delegation::spawner::DelegationLink;
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/um-deleg").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let parent =
             conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
                 .await
@@ -6111,7 +6272,7 @@ mod tests {
             &mgr,
             conn_id,
             AgentType::Codex,
-            Some(PathBuf::from("/tmp/um-deleg")),
+            Some(workspace.path().to_path_buf()),
         )
         .await;
 
@@ -6301,14 +6462,15 @@ mod tests {
     async fn send_prompt_linked_emits_user_prompt_sent_on_success() {
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/ups").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let mgr = ConnectionManager::new();
         let conn_id = "conn-ups-1";
         let _rx = insert_live_connection(
             &mgr,
             conn_id,
             AgentType::ClaudeCode,
-            Some(PathBuf::from("/tmp/ups")),
+            Some(workspace.path().to_path_buf()),
         )
         .await;
         let mut stream = subscribe_conn_stream(&mgr, conn_id).await;
@@ -6341,14 +6503,15 @@ mod tests {
     async fn send_prompt_linked_seeds_first_prompt_title_when_untitled() {
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/title-seed").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let mgr = ConnectionManager::new();
         let conn_id = "conn-title-seed";
         let _rx = insert_live_connection(
             &mgr,
             conn_id,
             AgentType::ClaudeCode,
-            Some(PathBuf::from("/tmp/title-seed")),
+            Some(workspace.path().to_path_buf()),
         )
         .await;
 
@@ -6389,14 +6552,15 @@ mod tests {
     async fn send_prompt_linked_skips_user_prompt_sent_for_textless_prompt() {
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/ups2").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let mgr = ConnectionManager::new();
         let conn_id = "conn-ups-2";
         let _rx = insert_live_connection(
             &mgr,
             conn_id,
             AgentType::ClaudeCode,
-            Some(PathBuf::from("/tmp/ups2")),
+            Some(workspace.path().to_path_buf()),
         )
         .await;
         let mut stream = subscribe_conn_stream(&mgr, conn_id).await;
@@ -6555,7 +6719,8 @@ mod tests {
     async fn send_prompt_linked_uses_caller_conversation_id_when_provided() {
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/caller-id").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
         // Pre-create a conversation row the caller will reference.
         let pre_existing =
             conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
@@ -6569,7 +6734,7 @@ mod tests {
             &mgr,
             conn_id,
             AgentType::ClaudeCode,
-            Some(PathBuf::from("/tmp/caller-id")),
+            Some(workspace.path().to_path_buf()),
             EventEmitter::test_web_only(broadcaster.clone()),
         )
         .await;
@@ -6644,7 +6809,8 @@ mod tests {
         // corrective `conversation://changed` upsert so other clients converge.
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/sess-pre-b").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let mgr = ConnectionManager::new();
         let (broadcaster, mut rx) = make_test_broadcaster();
         let conn_id = "conn-sess-pre-b";
@@ -6652,7 +6818,7 @@ mod tests {
             &mgr,
             conn_id,
             AgentType::ClaudeCode,
-            Some(PathBuf::from("/tmp/sess-pre-b")),
+            Some(workspace.path().to_path_buf()),
             EventEmitter::test_web_only(broadcaster.clone()),
         )
         .await;
@@ -6690,7 +6856,8 @@ mod tests {
         // Same precondition, caller-supplied conversation_id (adopt Branch A).
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/sess-pre-a").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let pre =
             conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
                 .await
@@ -6702,7 +6869,7 @@ mod tests {
             &mgr,
             conn_id,
             AgentType::ClaudeCode,
-            Some(PathBuf::from("/tmp/sess-pre-a")),
+            Some(workspace.path().to_path_buf()),
             EventEmitter::test_web_only(broadcaster.clone()),
         )
         .await;
@@ -6759,7 +6926,8 @@ mod tests {
     async fn send_prompt_linked_caller_id_is_noop_when_already_linked() {
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/already").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let pre =
             conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
                 .await
@@ -6772,7 +6940,7 @@ mod tests {
             &mgr,
             conn_id,
             AgentType::ClaudeCode,
-            Some(PathBuf::from("/tmp/already")),
+            Some(workspace.path().to_path_buf()),
             EventEmitter::test_web_only(broadcaster.clone()),
         )
         .await;
@@ -6839,7 +7007,8 @@ mod tests {
         use sea_orm::EntityTrait;
 
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/status").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
 
         let mgr = ConnectionManager::new();
         let (broadcaster, _rx) = make_test_broadcaster();
@@ -6848,7 +7017,7 @@ mod tests {
             &mgr,
             conn_id,
             AgentType::ClaudeCode,
-            Some(PathBuf::from("/tmp/status")),
+            Some(workspace.path().to_path_buf()),
             EventEmitter::test_web_only(broadcaster.clone()),
         )
         .await;
@@ -7431,7 +7600,8 @@ mod tests {
         use sea_orm::EntityTrait;
 
         let db = test_helpers::fresh_in_memory_db().await;
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/cancel-rollback").await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folder_id = test_helpers::seed_folder(&db, workspace.path().to_str().unwrap()).await;
 
         let mgr = ConnectionManager::new();
         let (broadcaster, _rx) = make_test_broadcaster();
@@ -7442,7 +7612,7 @@ mod tests {
             &mgr,
             conn_id,
             AgentType::ClaudeCode,
-            Some(PathBuf::from("/tmp/cancel-rollback")),
+            Some(workspace.path().to_path_buf()),
             EventEmitter::test_web_only(broadcaster.clone()),
         )
         .await;
