@@ -59,6 +59,7 @@ import {
   AlertCircle,
   CheckIcon,
   CopyIcon,
+  PencilIcon,
   Loader2,
   Plus,
   RefreshCw,
@@ -966,14 +967,15 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
         {group.role === "user" ? (
           <div className="group/user-msg flex w-fit ml-auto max-w-full items-start gap-1">
             {onEditUserTurn && sourceTurns?.[0] && (
-              <button
-                type="button"
-                className="rounded px-2 py-1 text-xs text-muted-foreground hover:bg-muted disabled:opacity-50"
+              <MessageAction
+                tooltip={tNative("edit")}
+                className="opacity-0 group-hover/user-msg:opacity-100 transition-opacity self-end"
+                size="icon-xs"
                 disabled={forkDisabled || nativeEditDisabled}
                 onClick={() => onEditUserTurn(sourceTurns[0])}
               >
-                {tNative("edit")}
-              </button>
+                <PencilIcon size={12} />
+              </MessageAction>
             )}
             <UserMessageTaskButton parts={group.parts} />
             <UserMessageCopyButton parts={group.parts} />
@@ -1426,9 +1428,7 @@ export function MessageListView({
                 onRoundOpenChange={handleRoundOpenChange}
                 foldEpoch={fold.epoch}
                 nativeEditDisabled={nativeEditDisabled}
-                onEditUserTurn={
-                  item.phase === "optimistic" ? undefined : onEditUserTurn
-                }
+                onEditUserTurn={onEditUserTurn}
                 onForkFromTurn={onForkFromTurn}
                 forkDisabled={forkBusy}
                 isThreadTail={item.isThreadTail}

@@ -1,4 +1,6 @@
+import { StrictMode } from "react"
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -213,6 +215,15 @@ describe("native session UI", () => {
   })
 })
 describe("native edit", () => {
+  function deferred<T>() {
+    let resolve!: (value: T) => void
+    let reject!: (reason: Error) => void
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res
+      reject = rej
+    })
+    return { promise, resolve, reject }
+  }
   const workspaceCaps = {
     workspaceRewindFiles: {
       version: 1,
@@ -221,6 +232,330 @@ describe("native edit", () => {
       previewTokenRequired: true,
     },
   }
+  const readyPreview = {
+    canRevert: true,
+    previewToken: "sha256:preview",
+    paths: ["answer.txt"],
+  }
+  function editProps() {
+    return {
+      turn,
+      caps: workspaceCaps,
+      execute: vi.fn().mockResolvedValue(readyPreview),
+      resolveTurn: vi.fn().mockResolvedValue(turn),
+      disabled: false,
+      onReconcile: vi.fn().mockResolvedValue(undefined),
+      onDraft: vi.fn(),
+      onClose: vi.fn(),
+    }
+  }
+  it("automatically previews once in StrictMode despite inline callbacks and only applies on confirmation", async () => {
+    const props = editProps()
+    const pending = deferred<typeof readyPreview>()
+    props.execute
+      .mockReturnValueOnce(pending.promise)
+      .mockResolvedValueOnce({ reverted: true })
+      .mockResolvedValueOnce({ rewound: true })
+    const view = () => (
+      <StrictMode>
+        <NativeEditDialog {...props} resolveTurn={async () => turn} />
+      </StrictMode>
+    )
+    const { rerender } = render(view())
+    expect(screen.getByText("confirmFilesAndHistory")).toBeDisabled()
+    await screen.findByText("filePreviewLoading")
+    await waitFor(() => expect(props.execute).toHaveBeenCalledTimes(1))
+    rerender(view())
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "edited while previewing" },
+    })
+    await act(async () => pending.resolve(readyPreview))
+    expect(screen.queryByText("filePreviewLoading")).not.toBeInTheDocument()
+    expect(screen.getByText("confirmFilesAndHistory")).not.toBeDisabled()
+    rerender(view())
+    expect(props.execute).toHaveBeenCalledTimes(1)
+    expect(props.execute).toHaveBeenNthCalledWith(1, "workspace_rewind_files", {
+      turnId: turn.id,
+      expectedTurn,
+      dryRun: true,
+    })
+    fireEvent.click(screen.getByText("confirmFilesAndHistory"))
+    fireEvent.click(screen.getByText("confirmFilesAndHistory"))
+    await waitFor(() => expect(props.onClose).toHaveBeenCalledTimes(1))
+    expect(props.execute).toHaveBeenCalledTimes(3)
+    expect(props.execute).toHaveBeenNthCalledWith(2, "workspace_rewind_files", {
+      turnId: turn.id,
+      expectedTurn,
+      dryRun: false,
+      previewToken: readyPreview.previewToken,
+    })
+    expect(props.onDraft).toHaveBeenCalledWith(
+      expect.objectContaining({ displayText: "edited while previewing" })
+    )
+  })
+
+  it.each(["reject", "refuse", "missing token"])(
+    "does not loop after preview %s; a manual retry enables confirmation",
+    async (failure) => {
+      const props = editProps()
+      if (failure === "reject")
+        props.execute.mockRejectedValueOnce(new Error("preview failed"))
+      else
+        props.execute.mockResolvedValueOnce(
+          failure === "refuse"
+            ? { canRevert: false, reason: "checkpoint_missing" }
+            : { canRevert: true }
+        )
+      const { rerender } = render(<NativeEditDialog {...props} />)
+      await waitFor(() => expect(props.execute).toHaveBeenCalledTimes(1))
+      await waitFor(() =>
+        expect(screen.queryByText("filePreviewLoading")).not.toBeInTheDocument()
+      )
+      expect(screen.getByText("confirmFilesAndHistory")).toBeDisabled()
+      rerender(<NativeEditDialog {...props} resolveTurn={async () => turn} />)
+      await act(async () => undefined)
+      expect(props.execute).toHaveBeenCalledTimes(1)
+      fireEvent.click(screen.getByText("preview"))
+      await waitFor(() =>
+        expect(screen.getByText("confirmFilesAndHistory")).not.toBeDisabled()
+      )
+      expect(props.execute).toHaveBeenCalledTimes(2)
+    }
+  )
+
+  it.each(["cancel", "keepDraft", "unmount", "disabled", "scope"])(
+    "discards unresolved target after %s without issuing a dryRun or mutation",
+    async (change) => {
+      const props = editProps()
+      const pending = deferred<MessageTurn>()
+      props.resolveTurn.mockReturnValueOnce(pending.promise)
+      const { rerender, unmount } = render(<NativeEditDialog {...props} />)
+      await waitFor(() => expect(props.resolveTurn).toHaveBeenCalledTimes(1))
+      if (change === "unmount") unmount()
+      else if (change === "disabled")
+        rerender(<NativeEditDialog {...props} disabled />)
+      else if (change === "scope")
+        fireEvent.click(screen.getByRole("radio", { name: "historyOnly" }))
+      else fireEvent.click(screen.getByText(change))
+      await act(async () => pending.resolve(turn))
+      expect(props.execute).not.toHaveBeenCalled()
+      expect(props.onReconcile).not.toHaveBeenCalled()
+      expect(props.onDraft).toHaveBeenCalledTimes(
+        change === "keepDraft" ? 1 : 0
+      )
+    }
+  )
+
+  it.each(["resolve", "reject"])(
+    "refreshes on returning to files and ignores an old preview %s",
+    async (result) => {
+      const props = editProps()
+      const old = deferred<typeof readyPreview>()
+      const fresh = deferred<typeof readyPreview>()
+      props.execute
+        .mockReturnValueOnce(old.promise)
+        .mockReturnValueOnce(fresh.promise)
+      render(<NativeEditDialog {...props} />)
+      await waitFor(() => expect(props.execute).toHaveBeenCalledTimes(1))
+      fireEvent.click(screen.getByRole("radio", { name: "historyOnly" }))
+      fireEvent.click(screen.getByRole("radio", { name: "historyAndFiles" }))
+      await screen.findByText("filePreviewLoading")
+      expect(props.execute).toHaveBeenCalledTimes(1)
+      await act(async () => {
+        if (result === "resolve") old.resolve(readyPreview)
+        else old.reject(new Error("obsolete failure"))
+      })
+      await waitFor(() => expect(props.execute).toHaveBeenCalledTimes(2))
+      expect(screen.queryByText("answer.txt")).not.toBeInTheDocument()
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+      expect(screen.getByText("confirmFilesAndHistory")).toBeDisabled()
+      await act(async () =>
+        fresh.resolve({ ...readyPreview, paths: ["fresh.txt"] })
+      )
+      expect(screen.getByText("fresh.txt")).toBeVisible()
+      expect(screen.getByText("confirmFilesAndHistory")).not.toBeDisabled()
+    }
+  )
+
+  it("waits while externally disabled and refreshes after re-enabling without reviving a stale preview", async () => {
+    const props = editProps()
+    const pending = deferred<typeof readyPreview>()
+    props.execute.mockReturnValueOnce(pending.promise)
+    const { rerender } = render(<NativeEditDialog {...props} disabled />)
+    await act(async () => undefined)
+    expect(props.resolveTurn).not.toHaveBeenCalled()
+    rerender(<NativeEditDialog {...props} />)
+    await waitFor(() => expect(props.execute).toHaveBeenCalledTimes(1))
+    rerender(<NativeEditDialog {...props} disabled />)
+    await act(async () => pending.resolve(readyPreview))
+    expect(screen.queryByText("answer.txt")).not.toBeInTheDocument()
+    expect(screen.getByText("confirmFilesAndHistory")).toBeDisabled()
+    rerender(<NativeEditDialog {...props} />)
+    await screen.findByText("answer.txt")
+    expect(props.execute).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(["cancel", "unmount"])(
+    "does not publish a dryRun result after %s",
+    async (change) => {
+      const props = editProps()
+      const pending = deferred<typeof readyPreview>()
+      props.execute.mockReturnValueOnce(pending.promise)
+      const { unmount } = render(<NativeEditDialog {...props} />)
+      await waitFor(() => expect(props.execute).toHaveBeenCalledTimes(1))
+      if (change === "unmount") unmount()
+      else fireEvent.click(screen.getByText("cancel"))
+      await act(async () => pending.resolve(readyPreview))
+      expect(screen.queryByText("answer.txt")).not.toBeInTheDocument()
+      expect(props.execute).toHaveBeenCalledTimes(1)
+      expect(props.onReconcile).not.toHaveBeenCalled()
+    }
+  )
+
+  it.each(["unmount", "disabled"])(
+    "does not rewind history or reuse the token after %s during file apply",
+    async (change) => {
+      const props = editProps()
+      const pending = deferred<{ reverted: boolean }>()
+      props.execute
+        .mockResolvedValueOnce(readyPreview)
+        .mockReturnValueOnce(pending.promise)
+      const { rerender, unmount } = render(<NativeEditDialog {...props} />)
+      await screen.findByText("answer.txt")
+      fireEvent.click(screen.getByText("confirmFilesAndHistory"))
+      await waitFor(() => expect(props.execute).toHaveBeenCalledTimes(2))
+      if (change === "unmount") unmount()
+      else {
+        rerender(<NativeEditDialog {...props} disabled />)
+        rerender(<NativeEditDialog {...props} />)
+      }
+      await act(async () => pending.resolve({ reverted: true }))
+      expect(props.execute).toHaveBeenCalledTimes(2)
+      expect(props.onReconcile).not.toHaveBeenCalled()
+      expect(props.onDraft).not.toHaveBeenCalled()
+      if (change === "disabled") {
+        expect(screen.getByText("confirmFilesAndHistory")).toBeDisabled()
+        expect(screen.getByText("preview")).toBeDisabled()
+      }
+    }
+  )
+
+  it.each(["transport", "uncertain", "outcome_unknown"])(
+    "does not automatically retry an unknown file outcome (%s) on scope effects",
+    async (failure) => {
+      const props = editProps()
+      props.execute.mockResolvedValueOnce(readyPreview)
+      if (failure === "transport")
+        props.execute.mockRejectedValueOnce(new Error("lost acknowledgement"))
+      else
+        props.execute.mockResolvedValueOnce({
+          reverted: false,
+          uncertain: failure === "uncertain",
+          reason: failure,
+        })
+      const { rerender } = render(<NativeEditDialog {...props} />)
+      await screen.findByText("answer.txt")
+      fireEvent.click(screen.getByText("confirmFilesAndHistory"))
+      await screen.findByRole("alert")
+      expect(screen.getByRole("radio", { name: "historyOnly" })).toBeDisabled()
+      rerender(<NativeEditDialog {...props} disabled />)
+      rerender(<NativeEditDialog {...props} />)
+      await act(async () => undefined)
+      expect(screen.getByText("preview")).toBeDisabled()
+      expect(screen.getByText("confirmFilesAndHistory")).toBeDisabled()
+      expect(props.execute).toHaveBeenCalledTimes(2)
+    }
+  )
+
+  it.each(["unmount", "disabled"])(
+    "does not start history mutation when target resolution finishes after %s",
+    async (change) => {
+      const props = { ...editProps(), caps: {} }
+      const pending = deferred<MessageTurn>()
+      props.resolveTurn.mockReturnValueOnce(pending.promise)
+      const { rerender, unmount } = render(<NativeEditDialog {...props} />)
+      fireEvent.click(screen.getByText("confirmEdit"))
+      await waitFor(() => expect(props.resolveTurn).toHaveBeenCalledTimes(1))
+      if (change === "unmount") unmount()
+      else rerender(<NativeEditDialog {...props} disabled />)
+      await act(async () => pending.resolve(turn))
+      expect(props.execute).not.toHaveBeenCalled()
+      expect(props.onDraft).not.toHaveBeenCalled()
+    }
+  )
+
+  it("does not publish a reconciled draft after unmount", async () => {
+    const props = { ...editProps(), caps: {} }
+    const pending = deferred<void>()
+    props.execute.mockResolvedValue({ rewound: true })
+    props.onReconcile.mockReturnValueOnce(pending.promise)
+    const { unmount } = render(<NativeEditDialog {...props} />)
+    fireEvent.click(screen.getByText("confirmEdit"))
+    await waitFor(() => expect(props.onReconcile).toHaveBeenCalledTimes(1))
+    unmount()
+    await act(async () => pending.resolve(undefined))
+    expect(props.onDraft).not.toHaveBeenCalled()
+    expect(props.onClose).not.toHaveBeenCalled()
+  })
+
+  it.each(["transport", "uncertain", "outcome_unknown"])(
+    "never retries an unknown history outcome (%s) after files were restored",
+    async (failure) => {
+      const props = editProps()
+      props.execute
+        .mockResolvedValueOnce(readyPreview)
+        .mockResolvedValueOnce({ reverted: true })
+      if (failure === "transport")
+        props.execute.mockRejectedValueOnce(new Error("lost history ack"))
+      else
+        props.execute.mockResolvedValueOnce({
+          rewound: false,
+          uncertain: failure === "uncertain",
+          reason: failure,
+        })
+      const { rerender } = render(<NativeEditDialog {...props} />)
+      await screen.findByText("answer.txt")
+      fireEvent.click(screen.getByText("confirmFilesAndHistory"))
+      await screen.findByRole("alert")
+      expect(screen.getByText("filesBeforeHistory")).toBeVisible()
+      expect(screen.getByText("confirmEdit")).toBeDisabled()
+      rerender(<NativeEditDialog {...props} disabled />)
+      rerender(<NativeEditDialog {...props} />)
+      fireEvent.click(screen.getByText("confirmEdit"))
+      await act(async () => undefined)
+      expect(props.execute.mock.calls.map((call) => call[0])).toEqual([
+        "workspace_rewind_files",
+        "workspace_rewind_files",
+        "rewind",
+      ])
+      expect(props.onReconcile).not.toHaveBeenCalled()
+      expect(props.onDraft).not.toHaveBeenCalled()
+    }
+  )
+
+  it.each(["unmount", "disabled"])(
+    "does not reconcile or publish a history response after %s",
+    async (change) => {
+      const props = { ...editProps(), caps: {} }
+      const pending = deferred<{ rewound: boolean }>()
+      props.execute.mockReturnValueOnce(pending.promise)
+      const { rerender, unmount } = render(<NativeEditDialog {...props} />)
+      fireEvent.click(screen.getByText("confirmEdit"))
+      await waitFor(() => expect(props.execute).toHaveBeenCalledTimes(1))
+      if (change === "unmount") unmount()
+      else {
+        rerender(<NativeEditDialog {...props} disabled />)
+        rerender(<NativeEditDialog {...props} />)
+      }
+      await act(async () => pending.resolve({ rewound: true }))
+      expect(props.execute).toHaveBeenCalledTimes(1)
+      expect(props.onReconcile).not.toHaveBeenCalled()
+      expect(props.onDraft).not.toHaveBeenCalled()
+      if (change === "disabled")
+        expect(screen.getByText("confirmEdit")).toBeDisabled()
+    }
+  )
+
   it("previews and restores files before rewinding history, without reapplying after a history refusal", async () => {
     const execute = vi
       .fn()
@@ -246,7 +581,6 @@ describe("native edit", () => {
       />
     )
     expect(screen.getByText("confirmFilesAndHistory")).toBeDisabled()
-    fireEvent.click(screen.getByText("preview"))
     await screen.findByText("answer.txt")
     fireEvent.click(screen.getByText("confirmFilesAndHistory"))
     await screen.findByRole("alert")
@@ -299,7 +633,6 @@ describe("native edit", () => {
         onClose={vi.fn()}
       />
     )
-    fireEvent.click(screen.getByText("preview"))
     await waitFor(() =>
       expect(screen.getByText("confirmFilesAndHistory")).not.toBeDisabled()
     )
@@ -337,7 +670,6 @@ describe("native edit", () => {
         onClose={vi.fn()}
       />
     )
-    fireEvent.click(screen.getByText("preview"))
     await screen.findByText("checkpoint_missing")
     expect(screen.getByText("confirmFilesAndHistory")).toBeDisabled()
     fireEvent.click(screen.getByRole("radio", { name: "historyOnly" }))

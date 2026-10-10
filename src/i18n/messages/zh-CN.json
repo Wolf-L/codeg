@@ -7011,6 +7011,7 @@
     "unarchive": "取消原生归档",
     "editTitle": "在原会话内编辑",
     "editHint": "回退将移除此消息及其后的对话历史。请选择是否同时恢复文件；编辑后的文字和图片会放回输入框，由你正常发送。",
+    "filePreviewLoading": "正在预览文件变更…",
     "filePreviewReady": "文件预览已就绪。将先恢复下列文件，再回退消息。",
     "filePreviewUnavailable": "此消息没有可用的完整文件检查点。",
     "workspaceFilesRestored": "工作目录文件已恢复。",

@@ -7012,6 +7012,7 @@
     "editTitle": "Edit in the same session",
     "editHint": "Rewind removes this message and all following conversation history. Choose whether to restore files too. The edited draft, including images, returns to the composer for you to send.",
     "rewindScope": "Rewind scope",
+    "filePreviewLoading": "Carregando a prévia das alterações nos arquivos…",
     "filePreviewReady": "File preview is ready. The listed files will be restored before the messages are rewound.",
     "filePreviewUnavailable": "No complete file checkpoint is available for this message.",
     "workspaceFilesRestored": "Workspace files restored.",

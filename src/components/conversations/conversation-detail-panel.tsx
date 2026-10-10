@@ -2186,9 +2186,7 @@ const ConversationTabView = memo(function ConversationTabView({
           connStatus !== "connected"
         }
         onEditUserTurn={
-          hasPersistedConversation &&
-          !conn.isViewer &&
-          nativeSupports(native.caps, "rewind")
+          !conn.isViewer && nativeSupports(native.caps, "rewind")
             ? handleNativeEdit
             : undefined
         }
@@ -2470,7 +2468,6 @@ const ConversationTabView = memo(function ConversationTabView({
             return resolveNativeEditTurn(nativeEdit.turn, fresh.turns)
           }}
           disabled={
-            native.pending ||
             connStatus !== "connected" ||
             conn.isViewer ||
             msgQueue.length > 0 ||

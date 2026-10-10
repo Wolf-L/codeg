@@ -7012,6 +7012,7 @@
     "editTitle": "Edit in the same session",
     "editHint": "Rewind removes this message and all following conversation history. Choose whether to restore files too. The edited draft, including images, returns to the composer for you to send.",
     "rewindScope": "Rewind scope",
+    "filePreviewLoading": "正在預覽檔案變更…",
     "filePreviewReady": "檔案預覽已就緒。將先還原下列檔案，再回退訊息。",
     "filePreviewUnavailable": "此訊息沒有可用的完整檔案檢查點。",
     "workspaceFilesRestored": "工作目錄檔案已還原。",

@@ -1,6 +1,13 @@
 "use client"
 
-import { useRef, useState } from "react"
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
 import { useTranslations } from "next-intl"
 import { Button } from "@/components/ui/button"
 import {
@@ -51,71 +58,159 @@ export function NativeEditDialog({
   const rewoundTurn = useRef<MessageTurn | null>(null)
   const supportsFiles = nativeSupports(caps, "workspace_rewind_files")
   const [restoreFiles, setRestoreFiles] = useState(supportsFiles)
+  const scope = useMemo(
+    () => ({ disabled, restoreFiles, supportsFiles, turnId: turn.id }),
+    [disabled, restoreFiles, supportsFiles, turn.id]
+  )
   const [preview, setPreview] = useState<{
+    scope: typeof scope
     target: MessageTurn
     data: Record<string, unknown>
   } | null>(null)
+  const currentPreview = preview?.scope === scope ? preview : null
+  const [previewing, setPreviewing] = useState<typeof scope | null>(null)
+  const loadingPreview = previewing === scope
   const [fileResult, setFileResult] = useState<Record<string, unknown> | null>(
     null
   )
   const [fileOutcomeUnknown, setFileOutcomeUnknown] = useState(false)
+  const outcomeUnknown = useRef(false)
   const restoredTurn = useRef<MessageTurn | null>(null)
   const draft = nativeEditDraft(turn, text)
-  async function previewFiles() {
-    if (lock.current || disabled || !supportsFiles) return
-    lock.current = true
-    setBusy(true)
+  const mounted = useRef(false)
+  const closed = useRef(false)
+  const generation = useRef(0)
+  const previewRequest = useRef(0)
+  const previewTask = useRef<Promise<void> | null>(null)
+  const latest = useRef({ scope, execute, resolveTurn })
+  useLayoutEffect(() => {
+    latest.current = { scope, execute, resolveTurn }
+  }, [scope, execute, resolveTurn])
+  useLayoutEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+      generation.current += 1
+    }
+  }, [scope])
+
+  const previewFiles = useCallback(() => {
+    const { scope } = latest.current
+    if (
+      !mounted.current ||
+      closed.current ||
+      lock.current ||
+      outcomeUnknown.current ||
+      restoredTurn.current ||
+      rewoundTurn.current ||
+      scope.disabled ||
+      !scope.restoreFiles ||
+      !scope.supportsFiles
+    )
+      return
+    const request = ++previewRequest.current
+    const version = generation.current
+    const isCurrent = () =>
+      mounted.current &&
+      !closed.current &&
+      generation.current === version &&
+      previewRequest.current === request
+    setPreviewing(scope)
     setError(null)
     setPreview(null)
-    try {
-      const target = await resolveTurn()
-      const turnId = nativeTurnId(target)
-      if (!turnId) throw new Error("User message is not saved yet")
-      const data = nativeRecord(
-        nativeResultData(
-          await execute("workspace_rewind_files", {
-            turnId,
-            expectedTurn: nativeExpectedTurn(target),
-            dryRun: true,
-          })
+    // A superseded read may still occupy the native hook. Wait for it before
+    // refreshing, but never let it publish into the new scope.
+    const previous = previewTask.current
+    previewTask.current = (async () => {
+      try {
+        await previous
+        if (!isCurrent()) return
+        const { execute, resolveTurn } = latest.current
+        const target = await resolveTurn()
+        if (!isCurrent()) return
+        const turnId = nativeTurnId(target)
+        if (!turnId) throw new Error("User message is not saved yet")
+        const data = nativeRecord(
+          nativeResultData(
+            await execute("workspace_rewind_files", {
+              turnId,
+              expectedTurn: nativeExpectedTurn(target),
+              dryRun: true,
+            })
+          )
         )
-      )
-      setPreview({ target, data })
-    } catch (e) {
-      setError(String(e))
-    } finally {
-      lock.current = false
-      setBusy(false)
+        if (!isCurrent()) return
+        setPreview({ scope, target, data })
+      } catch (e) {
+        if (isCurrent()) setError(String(e))
+      } finally {
+        if (isCurrent()) setPreviewing(null)
+      }
+    })()
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    // Defer past StrictMode's setup/cleanup replay. Callback identity and
+    // preview completion are deliberately not triggers for another preview.
+    void Promise.resolve().then(() => {
+      if (!cancelled) previewFiles()
+    })
+    return () => {
+      cancelled = true
     }
+  }, [scope, previewFiles])
+
+  function close() {
+    closed.current = true
+    generation.current += 1
+    onClose()
   }
   async function confirm() {
-    if (lock.current || disabled || fileOutcomeUnknown) return
+    if (
+      lock.current ||
+      disabled ||
+      closed.current ||
+      !mounted.current ||
+      loadingPreview ||
+      outcomeUnknown.current
+    )
+      return
+    const version = generation.current
+    const isCurrent = () =>
+      mounted.current && !closed.current && generation.current === version
     lock.current = true
     setBusy(true)
     setError(null)
     try {
+      await previewTask.current
+      if (!isCurrent()) return
       if (!rewound) {
         const target =
           restoredTurn.current ??
-          (restoreFiles ? preview?.target : await resolveTurn())
+          (restoreFiles ? currentPreview?.target : await resolveTurn())
+        if (!isCurrent()) return
         if (!target) throw new Error("Preview the file changes first")
         const turnId = nativeTurnId(target)
         if (!turnId) throw new Error("User message is not saved yet")
         if (restoreFiles && !restoredTurn.current) {
           if (
-            preview?.data.canRevert !== true ||
-            typeof preview.data.previewToken !== "string"
+            currentPreview?.data.canRevert !== true ||
+            typeof currentPreview.data.previewToken !== "string"
           )
             throw new Error("No verified file restore preview")
           // Conservatively block a second apply when the transport outcome is
           // unknown. A definitive refusal can be previewed again.
+          outcomeUnknown.current = true
           setFileOutcomeUnknown(true)
+          setPreview(null)
           const response = await execute("workspace_rewind_files", {
             turnId,
             expectedTurn: nativeExpectedTurn(target),
             dryRun: false,
-            previewToken: preview.data.previewToken,
+            previewToken: currentPreview.data.previewToken,
           })
+          if (!isCurrent()) return
           const data = nativeRecord(nativeResultData(response))
           setFileResult(data)
           if (
@@ -125,41 +220,48 @@ export function NativeEditDialog({
             throw new Error(
               "File restore outcome is unknown; inspect files before continuing"
             )
-          if (
-            data.uncertain !== true &&
-            !String(data.reason ?? "").includes("outcome_unknown")
-          )
-            setFileOutcomeUnknown(false)
-          if (data.reverted !== true) setPreview(null)
+          outcomeUnknown.current = false
+          setFileOutcomeUnknown(false)
           requireNativeAck(response, "reverted")
           restoredTurn.current = target
         }
-        requireNativeAck(
-          await execute("rewind", {
-            turnId,
-            expectedTurn: nativeExpectedTurn(target),
-          }),
-          "rewound"
+        if (!isCurrent()) return
+        outcomeUnknown.current = true
+        setFileOutcomeUnknown(true)
+        const response = await execute("rewind", {
+          turnId,
+          expectedTurn: nativeExpectedTurn(target),
+        })
+        if (!isCurrent()) return
+        const data = nativeRecord(nativeResultData(response))
+        if (
+          data.uncertain === true ||
+          String(data.reason ?? "").includes("outcome_unknown")
         )
+          throw new Error("History rewind outcome is unknown")
+        outcomeUnknown.current = false
+        setFileOutcomeUnknown(false)
+        requireNativeAck(response, "rewound")
         rewoundTurn.current = target
         setRewound(true)
       }
       if (!rewoundTurn.current) throw new Error("Missing rewind target")
       await onReconcile(rewoundTurn.current)
+      if (!isCurrent()) return
       onDraft(draft)
-      onClose()
+      close()
     } catch (e) {
-      setError(String(e))
+      if (isCurrent()) setError(String(e))
     } finally {
       lock.current = false
-      setBusy(false)
+      if (mounted.current && !closed.current) setBusy(false)
     }
   }
   return (
     <Dialog
       open
       onOpenChange={(open) => {
-        if (!open && !busy) onClose()
+        if (!open && !busy) close()
       }}
     >
       <DialogContent showCloseButton={!busy}>
@@ -169,7 +271,11 @@ export function NativeEditDialog({
         </DialogHeader>
         <fieldset
           disabled={
-            busy || rewound || !!restoredTurn.current || fileOutcomeUnknown
+            disabled ||
+            busy ||
+            rewound ||
+            !!restoredTurn.current ||
+            fileOutcomeUnknown
           }
           className="space-y-2"
         >
@@ -204,23 +310,30 @@ export function NativeEditDialog({
             </p>
             <Button
               variant="outline"
-              disabled={disabled || busy || fileOutcomeUnknown}
+              disabled={
+                disabled || busy || loadingPreview || fileOutcomeUnknown
+              }
               onClick={() => void previewFiles()}
             >
               {t("preview")}
             </Button>
-            {preview && (
+            {loadingPreview && (
+              <p role="status" aria-live="polite">
+                {t("filePreviewLoading")}
+              </p>
+            )}
+            {currentPreview && (
               <div className="space-y-1 text-sm" role="status">
                 <p>
                   {t(
-                    preview.data.canRevert === true
+                    currentPreview.data.canRevert === true
                       ? "filePreviewReady"
                       : "filePreviewUnavailable"
                   )}
                 </p>
-                {Array.isArray(preview.data.paths) && (
+                {Array.isArray(currentPreview.data.paths) && (
                   <ul className="max-h-40 list-disc overflow-y-auto pl-5">
-                    {preview.data.paths
+                    {currentPreview.data.paths
                       .filter(
                         (path): path is string => typeof path === "string"
                       )
@@ -229,8 +342,8 @@ export function NativeEditDialog({
                       ))}
                   </ul>
                 )}
-                {typeof preview.data.reason === "string" && (
-                  <p>{preview.data.reason}</p>
+                {typeof currentPreview.data.reason === "string" && (
+                  <p>{currentPreview.data.reason}</p>
                 )}
               </div>
             )}
@@ -277,12 +390,14 @@ export function NativeEditDialog({
             disabled={
               disabled ||
               busy ||
+              loadingPreview ||
               fileOutcomeUnknown ||
               (restoreFiles &&
                 !restoredTurn.current &&
                 !rewound &&
-                (preview?.data.canRevert !== true ||
-                  typeof preview.data.previewToken !== "string")) ||
+                (!supportsFiles ||
+                  currentPreview?.data.canRevert !== true ||
+                  typeof currentPreview.data.previewToken !== "string")) ||
               (!text.trim() && draft.blocks.length === 1)
             }
             onClick={() => void confirm()}
@@ -300,12 +415,12 @@ export function NativeEditDialog({
             disabled={busy}
             onClick={() => {
               onDraft(draft)
-              onClose()
+              close()
             }}
           >
             {t("keepDraft")}
           </Button>
-          <Button variant="ghost" disabled={busy} onClick={onClose}>
+          <Button variant="ghost" disabled={busy} onClick={close}>
             {t("cancel")}
           </Button>
         </div>

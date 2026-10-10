@@ -23,9 +23,10 @@ include Node; Git and platform system libraries remain OS prerequisites.
 
 ## Edit a previous user message
 
-The Edit action is available on completed user messages when the current
-adapter advertises same-session rewind. Finish or stop active work and resolve
-pending queues first. Confirming rewinds the native history in the same session,
+The Edit icon shares the hover action row with Copy and Create task when the
+current adapter advertises same-session rewind. It remains visible in that row
+during generation but is disabled until work stops and pending queues clear.
+It becomes usable in the same view without switching tabs or refreshing. Confirming rewinds the native history in the same session,
 refreshes the transcript and places the edited text/images back in the composer.
 Review and send normally. It does not create an edit fork or send automatically.
 Messages sent in the current connection can be edited without reopening the
@@ -43,7 +44,9 @@ history, not retrying the mutation.
 ## Restore files while editing
 
 The edit dialog defaults to **Messages and files** when Codeg advertises workspace
-checkpoints. Preview the affected paths, then confirm. Files are restored before
+checkpoints. Opening the dialog automatically previews the affected paths;
+confirm when the preview is ready. Switching back to Messages and files refreshes
+the preview. A failed preview can be retried explicitly. Files are restored before
 native history is rewound. **Messages only** explicitly keeps the current files.
 Codeg captures regular file bytes before and after completed host prompts, so
 command-line writes in a non-Git directory are covered too. Snapshots stay local.
